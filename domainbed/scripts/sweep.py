@@ -16,7 +16,7 @@ import sys
 import numpy as np
 import tqdm
 
-sys.path.append("/mnt/lustre/bli/projects/EIL/domainbed")
+sys.path.append("/home/hungnt/hungnt/Generalizable-Mixture-of-Experts/domainbed")
 
 from domainbed import algorithms
 from domainbed import command_launchers

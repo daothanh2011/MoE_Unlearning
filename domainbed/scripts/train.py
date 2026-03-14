@@ -8,7 +8,7 @@ import random
 import sys
 import time
 
-sys.path.append("/mnt/lustre/bli/projects/EIL/domainbed")
+sys.path.append("/home/hungnt/hungnt/Generalizable-Mixture-of-Experts/domainbed")
 os.environ['WANDB_API_KEY'] = 'abc1859572354a66fc85b2ad1d1009add929cbfa'
 
 import wandb

@@ -6,7 +6,7 @@ import sys
 
 import numpy as np
 
-sys.path.append("/mnt/lustre/bli/projects/EIL/domainbed")
+sys.path.append("/home/hungnt/hungnt/Generalizable-Mixture-of-Experts/domainbed")
 from domainbed import algorithms
 from domainbed import datasets
 from domainbed import model_selection

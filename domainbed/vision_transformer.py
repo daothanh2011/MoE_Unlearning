@@ -45,6 +45,8 @@ if float(torch.version.cuda) > 10.1:
     # tutel only works above cuda 10.1
     from tutel import moe as tutel_moe
 
+from domainbed.moe_layer import TransparentMoELayer
+
 _logger = logging.getLogger(__name__)
 
 
@@ -148,7 +150,7 @@ default_cfgs = {
         num_classes=21843),
     'vit_huge_patch14_224_in21k': _cfg(
         url='https://storage.googleapis.com/vit_models/imagenet21k/ViT-H_14.npz',
-        hf_hub='timm/vit_huge_patch14_224_in21k',
+        hf_hub_id='timm/vit_huge_patch14_224_in21k',
         num_classes=21843),
 
     # SAM trained models (https://arxiv.org/abs/2106.01548)
@@ -236,7 +238,7 @@ class Attention(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, cur_depth=0, moe_layers=None, num_experts=6, router='cosine_top'):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, cur_depth=0, moe_layers=None, num_experts=6, router='cosine_top', is_tutel=False, index_hook=False, top_k=1):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
@@ -244,6 +246,8 @@ class Block(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         self.aux_loss = None
+        self.routing_scores = None
+        self.expert_outputs = None
         self.is_moe_layer = False
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.cur_layer = moe_layers[cur_depth] if moe_layers is not None else 'F'
@@ -251,16 +255,31 @@ class Block(nn.Module):
         self.is_tutel = is_tutel
         self.aux_loss_weights = 0.01
         if self.cur_layer == 'S':
-            # print(f'cur_layer {cur_depth} is sparse with {num_experts} experts with BPR True')
-            self.mlp = tutel_moe.moe_layer(
-                gate_type={'type': router, 'k': 1, 'fp32_gate': True, 'gate_noise': 1.0, 'capacity_factor': 1.5},
-                experts={'type': 'ffn', 'count_per_node': num_experts,
-                         'hidden_size_per_expert': mlp_hidden_dim,
-                         'activation_fn': lambda x: self.moe_drop(F.gelu(x))},
-                model_dim=dim,
-                batch_prioritized_routing=True,
-                is_gshard_loss=False,
-            )
+            if is_tutel:
+                # Original Tutel path — routing_scores/expert_outputs remain None
+                self.mlp = tutel_moe.moe_layer(
+                    gate_type={'type': router, 'k': top_k, 'fp32_gate': True, 'gate_noise': 1.0, 'capacity_factor': 1.5},
+                    experts={'type': 'ffn', 'count_per_node': num_experts,
+                             'hidden_size_per_expert': mlp_hidden_dim,
+                             'activation_fn': lambda x: self.moe_drop(F.gelu(x))},
+                    model_dim=dim,
+                    batch_prioritized_routing=True,
+                    is_gshard_loss=False,
+                )
+            else:
+                # Transparent path — exposes routing_scores and expert_outputs for Lo/Lv
+                self.mlp = TransparentMoELayer(
+                    model_dim=dim,
+                    n_experts=num_experts,
+                    hidden_size_per_expert=mlp_hidden_dim,
+                    top_k=top_k,
+                    capacity_factor=1.5,
+                    gate_noise=1.0,
+                    proj_dim=256,
+                    init_temperature=0.5,
+                    fp32_gate=True,
+                    dropout=0.1,
+                )
         else:
             self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
@@ -272,6 +291,9 @@ class Block(nn.Module):
             x = x + self.drop_path(self.attn(self.norm1(x)))
             x = x + self.drop_path(self.mlp(self.norm2(x)))
             self.aux_loss = self.mlp.l_aux * self.aux_loss_weights
+            # TransparentMoELayer exposes these; Tutel path leaves them None
+            self.routing_scores = getattr(self.mlp, 'routing_scores', None)
+            self.expert_outputs = getattr(self.mlp, 'expert_outputs', None)
             return x
         elif self.cur_layer == 'F':
             x = x + self.drop_path(self.attn(self.norm1(x)))
@@ -294,7 +316,7 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, weight_init='', moe_layers=None, num_experts=6, index_hook=False, router='cosine_top'):
+                 act_layer=None, weight_init='', moe_layers=None, num_experts=6, index_hook=False, router='cosine_top', is_tutel=False, moe_top_k=1):
         """
         Args:
             img_size (int, tuple): input image size
@@ -335,7 +357,8 @@ class VisionTransformer(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
                 attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                cur_depth=i, moe_layers=moe_layers, num_experts=num_experts, index_hook=index_hook, router=router)
+                cur_depth=i, moe_layers=moe_layers, num_experts=num_experts, index_hook=index_hook, router=router,
+                is_tutel=is_tutel, top_k=moe_top_k)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 

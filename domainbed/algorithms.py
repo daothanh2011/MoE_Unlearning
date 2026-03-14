@@ -15,8 +15,9 @@ from domainbed.lib.misc import (
 from copy import deepcopy
 import copy
 
-sys.path.append('/mnt/lustre/bli/projects/EIL/domainbed')
-import vision_transformer, vision_transformer_hybrid
+import os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import vision_transformer
 from collections import defaultdict, OrderedDict
 
 try:
@@ -26,8 +27,9 @@ except:
     backpack = None
 
 from domainbed import networks
-from domainbed import resnet_variants
+# from domainbed import resnet_variants
 import torchvision.models as models
+from domainbed.losses.moe_specialization_losses import OrthoLoss, VarianceLoss
 
 ALGORITHMS = [
     'ERM',
@@ -192,28 +194,55 @@ class GMOE(Algorithm):
 
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(GMOE, self).__init__(input_shape, num_classes, num_domains, hparams)
-        self.model = vision_transformer.deit_small_patch16_224(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=4., num_experts=6, is_tutel=True, drop_path_rate=0.1, router='cosine_top').cuda()
+        moe_top_k = int(self.hparams.get('moe_top_k', 1))
+        num_experts = int(self.hparams.get('num_experts', 6))
+        self.model = vision_transformer.deit_small_patch16_224(
+            pretrained=True, num_classes=num_classes,
+            moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=4., num_experts=num_experts,
+            is_tutel=False, drop_path_rate=0.1, router='cosine_top',
+            moe_top_k=moe_top_k,
+        ).cuda()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.hparams["lr"], weight_decay=self.hparams['weight_decay'])
+        self.ortho_loss_fn = OrthoLoss()
+        self.variance_loss_fn = VarianceLoss()
 
     def update(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
+        device = all_x.device
         loss = F.cross_entropy(self.predict(all_x), all_y)
-        loss_aux_list = []
+
+        loss_aux      = torch.tensor(0., device=device)
+        ortho_loss    = torch.tensor(0., device=device)
+        variance_loss = torch.tensor(0., device=device)
+
         for block in self.model.blocks:
-            if getattr(block, 'aux_loss') is not None:
-                loss_aux_list.append(block.aux_loss)
+            if getattr(block, 'aux_loss', None) is not None:
+                loss_aux = loss_aux + block.aux_loss
 
-        loss_aux = 0
-        for layer_loss in loss_aux_list:
-            loss_aux += layer_loss
+                if (block.expert_outputs is not None
+                        and self.hparams.get('ortho_loss_weight', 0.0) > 0):
+                    ortho_loss = ortho_loss + self.ortho_loss_fn(block.expert_outputs)
 
-        loss += loss_aux
+                if (block.routing_scores is not None
+                        and self.hparams.get('variance_loss_weight', 0.0) > 0):
+                    variance_loss = variance_loss + self.variance_loss_fn(block.routing_scores)
+
+        loss = (loss
+                + loss_aux
+                + self.hparams.get('ortho_loss_weight', 0.0) * ortho_loss
+                + self.hparams.get('variance_loss_weight', 0.0) * variance_loss)
+
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        return {'loss': loss.item(), 'loss_aux': loss_aux.item()}
+        return {
+            'loss':           loss.item(),
+            'loss_aux':       loss_aux.item(),
+            'loss_ortho':     ortho_loss.item(),
+            'loss_variance':  variance_loss.item(),
+        }
 
     def predict(self, x, forward_feature=False):
         if forward_feature:
