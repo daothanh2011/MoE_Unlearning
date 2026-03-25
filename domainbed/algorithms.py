@@ -15,8 +15,8 @@ from domainbed.lib.misc import (
 from copy import deepcopy
 import copy
 
-sys.path.append('/mnt/lustre/bli/projects/EIL/domainbed')
-import vision_transformer, vision_transformer_hybrid
+sys.path.append('/home/hungnt/hungnt/Generalizable-Mixture-of-Experts/domainbed')
+import vision_transformer
 from collections import defaultdict, OrderedDict
 
 try:
@@ -26,7 +26,7 @@ except:
     backpack = None
 
 from domainbed import networks
-from domainbed import resnet_variants
+# from domainbed import resnet_variants
 import torchvision.models as models
 
 ALGORITHMS = [
@@ -195,6 +195,17 @@ class GMOE(Algorithm):
         self.model = vision_transformer.deit_small_patch16_224(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=4., num_experts=6, is_tutel=True, drop_path_rate=0.1, router='cosine_top').cuda()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.hparams["lr"], weight_decay=self.hparams['weight_decay'])
 
+    def _preprocess(self, x):
+        """Resize to 224×224 and expand to 3 channels if needed (e.g. CMNIST 2×28×28)."""
+        if x.shape[1] != 3:
+            ch_mean = x.mean(dim=1, keepdim=True)
+            x = torch.cat([x, ch_mean], dim=1)  # (B,2,H,W) → (B,3,H,W)
+            if x.shape[1] != 3:  # fallback for other channel counts
+                x = x[:, :3, :, :]
+        if x.shape[2] != 224 or x.shape[3] != 224:
+            x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+        return x
+
     def update(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
@@ -216,6 +227,7 @@ class GMOE(Algorithm):
         return {'loss': loss.item(), 'loss_aux': loss_aux.item()}
 
     def predict(self, x, forward_feature=False):
+        x = self._preprocess(x)
         if forward_feature:
             return self.model.forward_features(x)
         else:

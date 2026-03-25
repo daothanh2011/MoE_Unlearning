@@ -34,7 +34,7 @@ from PIL import Image
 from collections import OrderedDict
 
 sys.path.append("/mnt/lustre/bli/projects/EIL")
-from domainbed import vision_transformer, vision_transformer_hybrid
+from domainbed import vision_transformer
 
 
 def apply_mask(image, mask, color, alpha=0.5):

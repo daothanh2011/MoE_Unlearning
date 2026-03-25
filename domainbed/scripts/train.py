@@ -8,7 +8,7 @@ import random
 import sys
 import time
 
-sys.path.append("/mnt/lustre/bli/projects/EIL/domainbed")
+sys.path.append("/home/hungnt/hungnt/Generalizable-Mixture-of-Experts/domainbed")
 os.environ['WANDB_API_KEY'] = 'abc1859572354a66fc85b2ad1d1009add929cbfa'
 
 import wandb
@@ -17,6 +17,11 @@ import numpy as np
 import torch
 import torch.utils.data
 import torchvision
+
+# Patch Tutel CUDA kernels with pure-PyTorch fallbacks BEFORE importing
+# vision_transformer / algorithms (which import tutel at module level).
+# Required when Tutel's compiled extensions don't support the current GPU.
+import domainbed.tutel_patch  # noqa: F401
 
 from domainbed import algorithms
 from domainbed import datasets

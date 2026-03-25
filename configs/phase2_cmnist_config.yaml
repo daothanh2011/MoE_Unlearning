@@ -1,0 +1,45 @@
+# ============================================================
+# Phase 2 Finetuning Configuration — GMOE on ColoredMNIST
+# ============================================================
+data:
+  data_dir: "/home/hungnt/hungnt/DG_MoE/Generalizable-Mixture-of-Experts/domainbed/data"
+  dataset: "ColoredMNIST"
+
+phase1:
+  # Script resolves: {ckpt_base}/cmnist_env{env}/{ckpt_filename}
+  ckpt_base: "train_output"
+  ckpt_filename: "model.pkl"
+  env_prefix: "cmnist"
+
+output:
+  # Script resolves: {base_dir}/cmnist_addon_D_env{env}/
+  base_dir: "train_output"
+
+experiment:
+  env: 0
+  seed: 42
+
+embedding:
+  batch_size: 64
+  save_dir: null
+
+clustering:
+  k: 5
+  pca_dims: 50
+  algorithm: "kmeans"
+
+sampling:
+  x: 20
+  save_dhat: true
+
+finetuning:
+  lr: 1.0e-4
+  epochs: 30
+  batch_size: 32
+  augment: true
+  eval_every: 5
+  save_best: true
+
+skip:
+  extract: false
+  cluster: false
