@@ -1,0 +1,37 @@
+# Datasets
+domainbed/data/
+
+# Training outputs
+train_output/
+
+# Sweep logs and results
+sweep/logs/
+sweep/results/
+sweep/figures/
+
+# General logs
+logs/
+
+# Reports
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Experiment tracking
+wandb/
+
+# Misc
+*.DS_Store
+.env
+*.log

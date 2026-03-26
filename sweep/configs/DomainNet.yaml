@@ -1,4 +1,4 @@
 dataset:      "DomainNet"
-data_dir:     "./domainbed/data/domain_net/"
+data_dir:     "./domainbed/data/"
 test_envs:    [0, 1, 2, 3, 4, 5]
 domain_names: ["clip", "info", "paint", "quick", "real", "sketch"]

@@ -326,12 +326,22 @@ def load_pretrained(model, default_cfg=None, num_classes=1000, in_chans=3, filte
                 num_experts = block.mlp.num_global_experts
                 ## fc1
                 hidden_dim, input_dim = state_dict[f'blocks.{i}.mlp.fc1.weight'].shape
-                state_dict[f'blocks.{i}.mlp.experts.batched_fc1_w'] = state_dict[f'blocks.{i}.mlp.fc1.weight'].expand(num_experts, hidden_dim, input_dim)
-                state_dict[f'blocks.{i}.mlp.experts.batched_fc2_w'] = state_dict[f'blocks.{i}.mlp.fc2.weight'].expand(num_experts, input_dim, hidden_dim).permute(0, 2, 1)
+                # model_hidden may be smaller than hidden_dim when expert_prune_ratio > 0
+                model_hidden = block.mlp.experts.batched_fc1_w.shape[1]
+                fc1_w = state_dict[f'blocks.{i}.mlp.fc1.weight'].expand(num_experts, hidden_dim, input_dim)
+                fc2_w = state_dict[f'blocks.{i}.mlp.fc2.weight'].expand(num_experts, input_dim, hidden_dim).permute(0, 2, 1)
+                if model_hidden < hidden_dim:
+                    fc1_w = fc1_w[:, :model_hidden, :].contiguous()
+                    fc2_w = fc2_w[:, :model_hidden, :].contiguous()
+                state_dict[f'blocks.{i}.mlp.experts.batched_fc1_w'] = fc1_w
+                state_dict[f'blocks.{i}.mlp.experts.batched_fc2_w'] = fc2_w
                 for r in range(1, 3):
-                    hidden_dim, input_dim = state_dict[f'blocks.{i}.mlp.fc{r}.weight'].shape
+                    h_dim, _ = state_dict[f'blocks.{i}.mlp.fc{r}.weight'].shape
                     vit_mlp_bias = state_dict[f'blocks.{i}.mlp.fc{r}.bias']
-                    stacked_vit_mlp_bias = vit_mlp_bias.expand(num_experts, 1, hidden_dim)
+                    stacked_vit_mlp_bias = vit_mlp_bias.expand(num_experts, 1, h_dim)
+                    model_bias = getattr(block.mlp.experts, f'batched_fc{r}_bias')
+                    if model_bias.dim() == 2:  # pruned model stores bias as [N, H]
+                        stacked_vit_mlp_bias = stacked_vit_mlp_bias[:, 0, :model_bias.shape[1]].contiguous()
                     state_dict[f'blocks.{i}.mlp.experts.batched_fc{r}_bias'] = stacked_vit_mlp_bias
 
     key_list = list(state_dict.keys())
