@@ -4,13 +4,13 @@
 #
 # Usage:
 #   # Run all envs (0, 1, 2):
-#   bash scripts/train_cmnist.sh
+#   bash scripts/phase1/train_cmnist.sh
 #
 #   # Run a single env only:
-#   ENVS=0 bash scripts/train_cmnist.sh
+#   ENVS=0 bash scripts/phase1/train_cmnist.sh
 #
 #   # Override conda env:
-#   CONDA_ENV=myenv bash scripts/train_cmnist.sh
+#   CONDA_ENV=myenv bash scripts/phase1/train_cmnist.sh
 # ============================================================
 
 set -e
@@ -35,7 +35,7 @@ for ENV in $ENVS; do
         --algorithm GMOE \
         --test_envs $ENV \
         --data_dir "$DATA_DIR" \
-        --output_dir "train_output/cmnist_env${ENV}" \
+        --output_dir "train_output/phase1/cmnist_env${ENV}" \
         --hparams_seed 0 \
         --batch_size "${BATCH_SIZE:-16}" \
         2>&1 | tee "$LOG_FILE" | grep -E "Epoch|step|acc|loss|Saving|ERROR|Error|Traceback" || true
@@ -46,5 +46,5 @@ done
 
 echo "============================================================"
 echo "CMNIST baseline training complete."
-echo "Checkpoints: train_output/cmnist_env{0,1,2}/model.pkl"
+echo "Checkpoints: train_output/phase1/cmnist_env{0,1,2}/model.pkl"
 echo "============================================================"

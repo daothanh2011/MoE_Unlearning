@@ -192,7 +192,11 @@ class GMOE(Algorithm):
 
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(GMOE, self).__init__(input_shape, num_classes, num_domains, hparams)
-        self.model = vision_transformer.deit_small_patch16_224(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=4., num_experts=6, is_tutel=True, drop_path_rate=0.1, router='cosine_top').cuda()
+        num_experts  = hparams.get('num_experts',       6)
+        gate_k       = hparams.get('gate_k',            1)
+        mlp_ratio    = hparams.get('mlp_ratio',         4.0)
+        prune_ratio  = hparams.get('expert_prune_ratio', 0.0)
+        self.model = vision_transformer.deit_small_patch16_224(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=mlp_ratio, num_experts=num_experts, gate_k=gate_k, prune_ratio=prune_ratio, is_tutel=True, drop_path_rate=0.1, router='cosine_top').cuda()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.hparams["lr"], weight_decay=self.hparams['weight_decay'])
 
     def _preprocess(self, x):

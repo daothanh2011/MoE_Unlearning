@@ -169,6 +169,11 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('weight_decay_g', 0., lambda r: 10 ** r.uniform(-6, -2))
 
     if 'GMOE' in algorithm:
+        _hparam('num_experts',        6,   lambda r: 6)
+        _hparam('gate_k',             1,   lambda r: 1)
+        _hparam('mlp_ratio',          4.0, lambda r: 4.0)
+        _hparam('expert_prune_ratio', 0.0, lambda r: 0.0)
+
         if dataset == 'VLCS':
             _hparam('lr', 3e-5, lambda r: 10 ** r.uniform(-4.5, -2.5))
             _hparam('resnet_dropout', 0.5, lambda r: r.choice([0., 0.1, 0.5]))

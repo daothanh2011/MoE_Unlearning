@@ -1,0 +1,4 @@
+dataset:      "RotatedMNIST"
+data_dir:     "./domainbed/data/MNIST/"
+test_envs:    [0, 1, 2, 3, 4, 5]
+domain_names: ["0deg", "15deg", "30deg", "45deg", "60deg", "75deg"]

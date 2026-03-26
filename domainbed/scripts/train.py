@@ -28,6 +28,7 @@ from domainbed import datasets
 from domainbed import hparams_registry
 from domainbed.lib import misc
 from domainbed.lib.fast_data_loader import InfiniteDataLoader, FastDataLoader
+from domainbed.lib.sweep_logger import SweepLogger
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Domain generalization')
@@ -60,6 +61,10 @@ if __name__ == "__main__":
                         help="For domain adaptation, % of test to use unlabeled for training.")
     parser.add_argument('--skip_model_save', action='store_true')
     parser.add_argument('--save_model_every_checkpoint', action='store_true')
+    parser.add_argument('--sweep_log_dir', type=str, default=None,
+                        help='If set, write structured sweep logs to this directory.')
+    parser.add_argument('--sweep_run_id', type=str, default=None,
+                        help='Human-readable run ID for sweep logging (e.g. gmoe_N6_K2_PR00).')
     args = parser.parse_args()
 
     # If we ever want to implement checkpointing, just persist these values
@@ -204,6 +209,20 @@ if __name__ == "__main__":
 
     algorithm.to(device)
 
+    # Sweep logger — activated only when --sweep_log_dir is provided
+    sweep_logger = None
+    if args.sweep_log_dir:
+        run_id = args.sweep_run_id or os.path.basename(args.sweep_log_dir)
+        sweep_logger = SweepLogger(
+            log_dir=args.sweep_log_dir,
+            run_id=run_id,
+            hparams=hparams,
+            args=args,
+            model=algorithm.model if hasattr(algorithm, 'model') else None,
+        )
+        sweep_logger.write_hparams_json()
+        sweep_logger.start_run_meta()
+
     train_minibatches_iterator = zip(*train_loaders)
     uda_minibatches_iterator = zip(*uda_loaders)
     checkpoint_vals = collections.defaultdict(lambda: [])
@@ -279,6 +298,12 @@ if __name__ == "__main__":
             with open(epochs_path, 'a') as f:
                 f.write(json.dumps(results, sort_keys=True) + "\n")
 
+            if sweep_logger is not None:
+                avg_step_vals = {k: float(np.mean(v)) for k, v in checkpoint_vals.items()}
+                sweep_logger.append_train_log(step, avg_step_vals, results.get('mem_gb'))
+                sweep_logger.append_eval_log(step, results)
+                sweep_logger.append_expert_stats(step, algorithm)
+
             algorithm_dict = algorithm.state_dict()
             start_step = step + 1
             checkpoint_vals = collections.defaultdict(lambda: [])
@@ -287,6 +312,10 @@ if __name__ == "__main__":
                 save_checkpoint(f'model_step{step}.pkl')
 
     save_checkpoint('model.pkl')
+
+    if sweep_logger is not None:
+        sweep_logger.write_final_summary()
+        sweep_logger.close_run_meta(exit_code=0)
 
     with open(os.path.join(args.output_dir, 'done'), 'w') as f:
         f.write('done')

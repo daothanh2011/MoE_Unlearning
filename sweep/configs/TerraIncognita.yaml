@@ -1,0 +1,4 @@
+dataset:      "TerraIncognita"
+data_dir:     "./domainbed/data/terra_incognita/"
+test_envs:    [0, 1, 2, 3]
+domain_names: ["L100", "L38", "L43", "L46"]

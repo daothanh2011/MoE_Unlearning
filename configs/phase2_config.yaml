@@ -12,13 +12,13 @@ data:
 phase1:
   # Phase 1 checkpoint base directory. Script resolves full path as:
   #   {ckpt_base}/terra_env{env}/{ckpt_filename}
-  ckpt_base: "train_output"
+  ckpt_base: "train_output/phase1"
   ckpt_filename: "model.pkl"
 
 output:
   # Phase 2 output base directory. Script resolves as:
   #   {base_dir}/terra_addon_D_env{env}/
-  base_dir: "train_output"
+  base_dir: "train_output/phase2"
 
 experiment:
   # Which leave-one-out experiment (0=L100, 1=L38, 2=L43, 3=L46)

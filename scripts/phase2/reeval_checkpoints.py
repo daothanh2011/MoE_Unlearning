@@ -3,7 +3,7 @@ Re-evaluate all saved Phase 2 best checkpoints on the correct test split
 (80% in-split, same as Phase 1 sweep_acc) and update results.txt.
 
 Usage:
-    python scripts/reeval_checkpoints.py \
+    python scripts/phase2/reeval_checkpoints.py \
         [--train_output_dir train_output] \
         [--data_dir /path/to/terra_incognita_parent] \
         [--output train_output/results.txt]
@@ -102,8 +102,8 @@ def eval_env(env_idx, train_output_dir, terra_dir, terra_envs, device='cuda'):
         'epoch0_acc': float
         'results': {(k,x): acc}
     """
-    phase1_ckpt_path = os.path.join(train_output_dir, f"terra_env{env_idx}", "model.pkl")
-    addon_dir        = os.path.join(train_output_dir, f"terra_addon_D_env{env_idx}")
+    phase1_ckpt_path = os.path.join(train_output_dir, "phase1", f"terra_env{env_idx}", "model.pkl")
+    addon_dir        = os.path.join(train_output_dir, "phase2", f"terra_addon_D_env{env_idx}")
 
     print(f"\n{'='*60}")
     print(f" Env {env_idx} ({ENV_NAMES[env_idx]})")
@@ -168,7 +168,7 @@ def load_phase1_baselines(train_output_dir):
     """Load Phase 1 sweep_acc per env via IIDAccuracySelectionMethod."""
     from domainbed.lib.query import Q
     baselines = {}
-    records = Q(reporting.load_records(train_output_dir))
+    records = Q(reporting.load_records(os.path.join(train_output_dir, "phase1")))
     if not len(records):
         print("  WARNING: no Phase 1 records found")
         return baselines
@@ -299,7 +299,7 @@ def write_results(output_path, eval_data, phase1_baselines, log_dir=None):
         )
         # Try to get dhat size
         dhat_size = "?"
-        for td in [f"train_output/terra_addon_D_env{env_idx}",
+        for td in [f"train_output/phase2/terra_addon_D_env{env_idx}",
                    f"terra_addon_D_env{env_idx}"]:
             p = os.path.join(td, f"dhat_k{bk}_x{bx}.json")
             if os.path.exists(p):
@@ -379,7 +379,7 @@ def parse_args():
     p.add_argument("--train_output_dir", default="train_output")
     p.add_argument("--data_dir", default=None,
                    help="Parent dir of terra_incognita/. Auto-detected from Phase 1 ckpt if omitted.")
-    p.add_argument("--output", default="train_output/results.txt")
+    p.add_argument("--output", default="train_output/phase2/results.txt")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -391,7 +391,7 @@ def main():
     data_dir = args.data_dir
     if data_dir is None:
         ckpt0 = torch.load(
-            os.path.join(args.train_output_dir, "terra_env0", "model.pkl"),
+            os.path.join(args.train_output_dir, "phase1", "terra_env0", "model.pkl"),
             map_location='cpu'
         )
         data_dir = ckpt0['args']['data_dir']
@@ -410,7 +410,7 @@ def main():
         )
 
     # Save raw results as JSON for reference
-    json_out = os.path.join(args.train_output_dir, "reeval_results.json")
+    json_out = os.path.join(args.train_output_dir, "phase2", "reeval_results.json")
     serializable = {
         str(env_idx): {
             'epoch0_acc': eval_data[env_idx]['epoch0_acc'],
@@ -423,7 +423,7 @@ def main():
     print(f"\nRaw results saved to: {json_out}")
 
     write_results(args.output, eval_data, phase1_baselines,
-                  log_dir=os.path.join(args.train_output_dir))
+                  log_dir=os.path.join(args.train_output_dir, "phase2"))
 
 
 if __name__ == "__main__":

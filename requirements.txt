@@ -1,6 +1,37 @@
-gdown==4.2.0
+# Core ML framework
+torch>=2.0
+torchvision>=0.15
+
+# Vision Transformer backbone (DeiT-S/16)
+timm>=1.0
+
+# Mixture-of-Experts layer — requires custom build:
+#   pip install tutel  (https://github.com/microsoft/tutel)
+
+# Data & preprocessing
 numpy>=1.22
-Pillow==9.0.1
+Pillow>=9.0
+scikit-learn>=1.0
+
+# Sweep infrastructure & visualization
+PyYAML>=6.0
+matplotlib>=3.7
+tqdm>=4.0
+
+# Experiment tracking
+wandb>=0.15
+
+# Dataset download & benchmark
+gdown==4.2.0
+wilds>=2.0
+
+# DomainBed utilities (pinned to match original repo)
 prettytable==2.1.0
 sconf==0.2.3
 tensorboardX==2.5
+
+# Optional — only needed for scripts in exps/
+opencv-python
+scikit-image
+requests
+imageio

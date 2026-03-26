@@ -7,13 +7,13 @@ data:
 
 phase1:
   # Script resolves: {ckpt_base}/cmnist_env{env}/{ckpt_filename}
-  ckpt_base: "train_output"
+  ckpt_base: "train_output/phase1"
   ckpt_filename: "model.pkl"
   env_prefix: "cmnist"
 
 output:
   # Script resolves: {base_dir}/cmnist_addon_D_env{env}/
-  base_dir: "train_output"
+  base_dir: "train_output/phase2"
 
 experiment:
   env: 0

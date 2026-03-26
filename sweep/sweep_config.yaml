@@ -1,0 +1,37 @@
+sweep_name: "gmoe_expert_sweep"
+description: "Sweep over num_experts, top_k (gate_k), and expert_prune_ratio for GMoE ICLR2023 baseline"
+
+# --- Parameter Grid ---
+param_grid:
+  num_experts:        [2, 4, 6, 8, 12]
+  top_k:              [1, 2, 4, 8]
+  expert_prune_ratio: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+# --- Fixed Hyperparams (do not sweep these) ---
+# dataset/data_dir/test_envs are specified per-dataset in sweep/configs/{Dataset}.yaml
+fixed_params:
+  algorithm:       "GMOE"
+  steps:           5000
+  checkpoint_freq: 500
+  seed:            0
+  mlp_ratio:       4.0   # controls base expert hidden dim (D = embed_dim * mlp_ratio = 1536)
+
+# --- Constraints: skip invalid combinations ---
+# top_k must always be <= num_experts
+constraints:
+  - "top_k <= num_experts"
+
+# --- Baseline config (reference point in all plots) ---
+baseline:
+  num_experts:        6
+  top_k:              2
+  expert_prune_ratio: 0.0
+
+# --- Output paths ---
+output:
+  log_dir:       "sweep/logs"
+  results_dir:   "sweep/results"
+  checkpoint_dir: "sweep/checkpoints"
+  figures_dir:   "sweep/figures"
+  summary_csv:   "sweep/results/sweep_summary.csv"
+  sweep_status:  "sweep/sweep_status.json"

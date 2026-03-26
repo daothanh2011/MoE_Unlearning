@@ -5,16 +5,16 @@
 #
 # Usage:
 #   # Run all envs, all k/x combos:
-#   bash scripts/ablation_sweep.sh
+#   bash scripts/phase2/ablation_sweep.sh
 #
 #   # Run a single env only:
-#   ENV=0 bash scripts/ablation_sweep.sh
+#   ENV=0 bash scripts/phase2/ablation_sweep.sh
 #
 #   # Skip embedding extraction (re-use saved embeddings):
-#   SKIP_EXTRACT=1 bash scripts/ablation_sweep.sh
+#   SKIP_EXTRACT=1 bash scripts/phase2/ablation_sweep.sh
 #
 #   # Skip clustering + D-hat sampling too:
-#   SKIP_EXTRACT=1 SKIP_CLUSTER=1 bash scripts/ablation_sweep.sh
+#   SKIP_EXTRACT=1 SKIP_CLUSTER=1 bash scripts/phase2/ablation_sweep.sh
 # ============================================================
 
 set -e  # exit on first error

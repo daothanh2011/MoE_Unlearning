@@ -8,11 +8,11 @@ Parses all log files in --log_dir, loads the GMOE Phase 1 baseline from
 No retraining or checkpoint loading required.
 
 Usage:
-    python scripts/analyze_dhat.py
-    python scripts/analyze_dhat.py \
+    python scripts/phase2/analyze_dhat.py
+    python scripts/phase2/analyze_dhat.py \
         --log_dir logs/ablation_20260322_180826 \
-        --train_output_dir train_output \
-        --output train_output/results.txt
+        --train_output_dir train_output/phase1 \
+        --output train_output/phase2/results.txt
 """
 
 import argparse
@@ -466,12 +466,12 @@ def main():
     parser = argparse.ArgumentParser(description='Analyze GMOE_DHAT ablation logs')
     parser.add_argument('--log_dir', default='logs/ablation_20260322_180826',
                         help='Directory containing env*_k*_x*.log files')
-    parser.add_argument('--train_output_dir', default='train_output',
+    parser.add_argument('--train_output_dir', default='train_output/phase1',
                         help='Directory containing {dataset}_env{i}/ subdirs with Phase 1 results.jsonl')
     parser.add_argument('--dataset', default='TerraIncognita',
                         choices=list(DATASET_CONFIGS.keys()),
                         help='Dataset name (default: TerraIncognita)')
-    parser.add_argument('--output', default='train_output/results.txt',
+    parser.add_argument('--output', default='train_output/phase2/results.txt',
                         help='Output path for the analysis report')
     args = parser.parse_args()
 

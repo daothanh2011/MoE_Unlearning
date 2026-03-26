@@ -1,0 +1,4 @@
+dataset:      "OfficeHome"
+data_dir:     "./domainbed/data/office_home/"
+test_envs:    [0, 1, 2, 3]
+domain_names: ["A", "C", "P", "R"]
