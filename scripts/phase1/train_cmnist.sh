@@ -15,7 +15,9 @@
 
 set -e
 
-DATA_DIR="${DATA_DIR:-/home/hungnt/hungnt/DG_MoE/Generalizable-Mixture-of-Experts/domainbed/data}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+DATA_DIR="${DATA_DIR:-${REPO_ROOT}/domainbed/data}"
 CONDA_ENV="${CONDA_ENV:-gmoe}"
 ENVS="${ENVS:-0 1 2}"
 

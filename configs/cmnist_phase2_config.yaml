@@ -6,7 +6,7 @@
 
 data:
   # Root directory containing MNIST data
-  data_dir: "/home/hungnt/hungnt/DG_MoE/Generalizable-Mixture-of-Experts/domainbed/data"
+  data_dir: "./domainbed/data"
   dataset: "ColoredMNIST"
 
 phase1:

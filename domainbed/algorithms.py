@@ -1,5 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
+import os
 import sys
 from itertools import chain
 
@@ -15,7 +16,7 @@ from domainbed.lib.misc import (
 from copy import deepcopy
 import copy
 
-sys.path.append('/home/hungnt/hungnt/Generalizable-Mixture-of-Experts/domainbed')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vision_transformer
 from collections import defaultdict, OrderedDict
 

@@ -8,8 +8,7 @@ import random
 import sys
 import time
 
-sys.path.append("/home/hungnt/hungnt/Generalizable-Mixture-of-Experts/domainbed")
-os.environ['WANDB_API_KEY'] = 'abc1859572354a66fc85b2ad1d1009add929cbfa'
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import wandb
 import PIL
@@ -32,7 +31,7 @@ from domainbed.lib.sweep_logger import SweepLogger
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Domain generalization')
-    parser.add_argument('--data_dir', type=str, default='/mnt/lustre/share/boli/domainbed_data')
+    parser.add_argument('--data_dir', type=str, default='./domainbed/data')
     parser.add_argument('--dataset', type=str, default="RotatedMNIST")
     parser.add_argument('--algorithm', type=str, default="ERM")
     parser.add_argument('--task', type=str, default="domain_generalization",

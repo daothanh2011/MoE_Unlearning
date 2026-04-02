@@ -16,7 +16,7 @@ import sys
 import numpy as np
 import tqdm
 
-sys.path.append("/home/hungnt/hungnt/Generalizable-Mixture-of-Experts/domainbed")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from domainbed import algorithms
 from domainbed import command_launchers
@@ -146,7 +146,7 @@ if __name__ == "__main__":
     parser.add_argument('--n_hparams_from', type=int, default=0)
     parser.add_argument('--n_hparams', type=int, default=20)
     parser.add_argument('--output_dir', type=str, required=True)
-    parser.add_argument('--data_dir', type=str, default='/mnt/lustre/share/boli/domainbed_data')
+    parser.add_argument('--data_dir', type=str, default='./domainbed/data')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--n_trials', type=int, default=3)
     parser.add_argument('--command_launcher', type=str, required=True)

@@ -133,7 +133,7 @@ def main():
     parser = argparse.ArgumentParser('Visualize GMOE expert routing')
     parser.add_argument('--checkpoint', default='train_output/model.pkl')
     parser.add_argument('--data_dir',
-                        default='/media/hungnt/domainbed/data/terra_incognita/L43')
+                        default='./domainbed/data/terra_incognita/L43')
     parser.add_argument('--n_images', type=int, default=4)
     parser.add_argument('--block', type=int, default=8,
                         help='MoE block index to visualize (8 or 10)')

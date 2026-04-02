@@ -6,7 +6,7 @@ import sys
 
 import numpy as np
 
-sys.path.append("/home/hungnt/hungnt/Generalizable-Mixture-of-Experts/domainbed")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from domainbed import algorithms
 from domainbed import datasets
 from domainbed import model_selection
