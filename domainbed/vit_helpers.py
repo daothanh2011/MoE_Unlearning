@@ -334,19 +334,22 @@ def load_pretrained(model, default_cfg=None, num_classes=1000, in_chans=3, filte
                 model_hidden = block.mlp.experts.batched_fc1_w.shape[1]
                 fc1_w = state_dict[f'blocks.{i}.mlp.fc1.weight'].expand(num_experts, hidden_dim, input_dim)
                 fc2_w = state_dict[f'blocks.{i}.mlp.fc2.weight'].expand(num_experts, input_dim, hidden_dim).permute(0, 2, 1)
-                if model_hidden < hidden_dim:
+                if model_hidden <= hidden_dim:
+                    # model hidden ≤ pretrained: copy (possibly pruned) slice
                     fc1_w = fc1_w[:, :model_hidden, :].contiguous()
                     fc2_w = fc2_w[:, :model_hidden, :].contiguous()
-                state_dict[f'blocks.{i}.mlp.experts.batched_fc1_w'] = fc1_w
-                state_dict[f'blocks.{i}.mlp.experts.batched_fc2_w'] = fc2_w
-                for r in range(1, 3):
-                    h_dim, _ = state_dict[f'blocks.{i}.mlp.fc{r}.weight'].shape
-                    vit_mlp_bias = state_dict[f'blocks.{i}.mlp.fc{r}.bias']
-                    stacked_vit_mlp_bias = vit_mlp_bias.expand(num_experts, 1, h_dim)
-                    model_bias = getattr(block.mlp.experts, f'batched_fc{r}_bias')
-                    if model_bias.dim() == 2:  # pruned model stores bias as [N, H]
-                        stacked_vit_mlp_bias = stacked_vit_mlp_bias[:, 0, :model_bias.shape[1]].contiguous()
-                    state_dict[f'blocks.{i}.mlp.experts.batched_fc{r}_bias'] = stacked_vit_mlp_bias
+                    state_dict[f'blocks.{i}.mlp.experts.batched_fc1_w'] = fc1_w
+                    state_dict[f'blocks.{i}.mlp.experts.batched_fc2_w'] = fc2_w
+                    for r in range(1, 3):
+                        h_dim, _ = state_dict[f'blocks.{i}.mlp.fc{r}.weight'].shape
+                        vit_mlp_bias = state_dict[f'blocks.{i}.mlp.fc{r}.bias']
+                        stacked_vit_mlp_bias = vit_mlp_bias.expand(num_experts, 1, h_dim)
+                        model_bias = getattr(block.mlp.experts, f'batched_fc{r}_bias')
+                        if model_bias.dim() == 2:  # pruned model stores bias as [N, H]
+                            stacked_vit_mlp_bias = stacked_vit_mlp_bias[:, 0, :model_bias.shape[1]].contiguous()
+                        state_dict[f'blocks.{i}.mlp.experts.batched_fc{r}_bias'] = stacked_vit_mlp_bias
+                # else: model hidden > pretrained (mlp_ratio > 4.0) — skip insertion,
+                # experts keep random init; load_state_dict(strict=False) ignores missing keys
             elif isinstance(block.mlp.experts, nn.ModuleList):
                 # --- DeepMoELayer experts (expert_depth >= 3) ---
                 # Load pretrained fc1/fc2 into the first and last layer of each expert.
@@ -355,14 +358,16 @@ def load_pretrained(model, default_cfg=None, num_classes=1000, in_chans=3, filte
                 fc1_b    = state_dict[f'blocks.{i}.mlp.fc1.bias']     # (H,)
                 fc2_w    = state_dict[f'blocks.{i}.mlp.fc2.weight']   # (D, H)
                 fc2_b    = state_dict[f'blocks.{i}.mlp.fc2.bias']     # (D,)
+                pretrained_h = fc1_w.shape[0]
                 for expert in block.mlp.experts:
-                    model_h = expert.layers[0].weight.shape[0]         # actual hidden (may be pruned)
-                    # First layer: D → H
-                    expert.layers[0].weight.data.copy_(fc1_w[:model_h].contiguous())
-                    expert.layers[0].bias.data.copy_(fc1_b[:model_h].contiguous())
-                    # Last layer: H → D  (fc2_w is (D, H) = (out, in), same as nn.Linear weight layout)
-                    expert.layers[-1].weight.data.copy_(fc2_w[:, :model_h].contiguous())
-                    expert.layers[-1].bias.data.copy_(fc2_b.contiguous())
+                    model_h = expert.layers[0].weight.shape[0]         # actual hidden
+                    if model_h <= pretrained_h:
+                        # model hidden ≤ pretrained: copy (possibly pruned) slice
+                        expert.layers[0].weight.data.copy_(fc1_w[:model_h].contiguous())
+                        expert.layers[0].bias.data.copy_(fc1_b[:model_h].contiguous())
+                        expert.layers[-1].weight.data.copy_(fc2_w[:, :model_h].contiguous())
+                        expert.layers[-1].bias.data.copy_(fc2_b.contiguous())
+                    # else: model hidden > pretrained (mlp_ratio > 4.0) — keep random init
 
     key_list = list(state_dict.keys())
     for item in removed_index:
