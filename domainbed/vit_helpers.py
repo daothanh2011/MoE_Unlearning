@@ -19,7 +19,10 @@ from timm.models.hub import has_hf_hub, download_cached_file, load_state_dict_fr
 from timm.models.layers import Conv2dSame, Linear
 from timm.models.vision_transformer import VisionTransformer, resize_pos_embed
 
-import tutel.impls.moe_layer as moe_layer
+try:
+    import tutel.impls.moe_layer as moe_layer
+except ImportError:
+    moe_layer = None
 
 _logger = logging.getLogger(__name__)
 
@@ -322,7 +325,8 @@ def load_pretrained(model, default_cfg=None, num_classes=1000, in_chans=3, filte
     for i, block in enumerate(model.blocks.children()):
         if hasattr(block.mlp, 'experts'):
             removed_index.append(i)
-            if isinstance(block.mlp, moe_layer.MOELayer):
+            if moe_layer is not None and isinstance(block.mlp, moe_layer.MOELayer):
+                # --- Tutel 2-layer FFN experts (expert_depth == 2) ---
                 num_experts = block.mlp.num_global_experts
                 ## fc1
                 hidden_dim, input_dim = state_dict[f'blocks.{i}.mlp.fc1.weight'].shape
@@ -343,12 +347,43 @@ def load_pretrained(model, default_cfg=None, num_classes=1000, in_chans=3, filte
                     if model_bias.dim() == 2:  # pruned model stores bias as [N, H]
                         stacked_vit_mlp_bias = stacked_vit_mlp_bias[:, 0, :model_bias.shape[1]].contiguous()
                     state_dict[f'blocks.{i}.mlp.experts.batched_fc{r}_bias'] = stacked_vit_mlp_bias
+            elif isinstance(block.mlp.experts, nn.ModuleList):
+                # --- DeepMoELayer experts (expert_depth >= 3) ---
+                # Load pretrained fc1/fc2 into the first and last layer of each expert.
+                # Middle layers (index 1 … depth-2) are left with random init.
+                fc1_w    = state_dict[f'blocks.{i}.mlp.fc1.weight']   # (H, D)
+                fc1_b    = state_dict[f'blocks.{i}.mlp.fc1.bias']     # (H,)
+                fc2_w    = state_dict[f'blocks.{i}.mlp.fc2.weight']   # (D, H)
+                fc2_b    = state_dict[f'blocks.{i}.mlp.fc2.bias']     # (D,)
+                for expert in block.mlp.experts:
+                    model_h = expert.layers[0].weight.shape[0]         # actual hidden (may be pruned)
+                    # First layer: D → H
+                    expert.layers[0].weight.data.copy_(fc1_w[:model_h].contiguous())
+                    expert.layers[0].bias.data.copy_(fc1_b[:model_h].contiguous())
+                    # Last layer: H → D  (fc2_w is (D, H) = (out, in), same as nn.Linear weight layout)
+                    expert.layers[-1].weight.data.copy_(fc2_w[:, :model_h].contiguous())
+                    expert.layers[-1].bias.data.copy_(fc2_b.contiguous())
 
     key_list = list(state_dict.keys())
     for item in removed_index:
         for key in key_list:
             if f'blocks.{item}.mlp.fc' in key:
                 state_dict.pop(key)
+
+    # Remove any remaining blocks.*.mlp.fc* keys whose shape doesn't match the
+    # current model (e.g. dense blocks when mlp_ratio != pretrained value of 4.0).
+    # load_state_dict raises RuntimeError on shape mismatches even with strict=False.
+    named_params = dict(model.named_parameters())
+    key_list = list(state_dict.keys())
+    for key in key_list:
+        if '.mlp.fc' not in key:
+            continue
+        if key not in state_dict:
+            continue
+        model_param = named_params.get(key)
+        if model_param is not None and state_dict[key].shape != model_param.shape:
+            state_dict.pop(key)
+
     msg = model.load_state_dict(state_dict, strict=strict)
     print(msg)
 

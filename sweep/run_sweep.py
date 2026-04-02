@@ -50,15 +50,25 @@ def list_available_datasets(configs_dir="sweep/configs"):
     return [os.path.splitext(os.path.basename(p))[0] for p in sorted(paths)]
 
 
-def make_run_id(dataset, num_experts, top_k, expert_prune_ratio, test_env):
-    pr_int = int(round(expert_prune_ratio * 10))
-    return f"{dataset}_N{num_experts}_K{top_k}_PR{pr_int:02d}_env{test_env}"
+_MODEL_TAG = {
+    "deit_tiny_patch16_224":  "Ti",
+    "deit_small_patch16_224": "S",
+    "deit_base_patch16_224":  "B",
+}
 
 
-def check_constraint(num_experts, top_k, expert_prune_ratio, constraints):
+def make_run_id(dataset, num_experts, top_k, expert_prune_ratio, mlp_ratio, expert_depth, test_env, model="deit_small_patch16_224"):
+    pr_int   = int(round(expert_prune_ratio * 10))
+    mlp_str  = str(mlp_ratio).replace('.', 'p')   # e.g. 5.2 → "5p2"
+    model_tag = _MODEL_TAG.get(model, model)       # fallback to full name if unknown
+    return f"{dataset}_{model_tag}_N{num_experts}_K{top_k}_PR{pr_int:02d}_MLP{mlp_str}_D{expert_depth}_env{test_env}"
+
+
+def check_constraint(num_experts, top_k, expert_prune_ratio, mlp_ratio, expert_depth, constraints):
     for expr in constraints:
         local = {"top_k": top_k, "num_experts": num_experts,
-                 "expert_prune_ratio": expert_prune_ratio}
+                 "expert_prune_ratio": expert_prune_ratio,
+                 "mlp_ratio": mlp_ratio, "expert_depth": expert_depth}
         try:
             if not eval(expr, {"__builtins__": {}}, local):
                 return False
@@ -89,15 +99,17 @@ def parse_filter(filter_str):
 # ---------------------------------------------------------------------------
 
 def build_command(run_id, dataset_cfg, num_experts, top_k, expert_prune_ratio,
-                  test_env, cfg):
+                  mlp_ratio, expert_depth, test_env, cfg):
     fixed   = cfg["fixed_params"]
     outputs = cfg["output"]
 
     hparams = {
         "num_experts":        num_experts,
         "gate_k":             top_k,
-        "mlp_ratio":          fixed.get("mlp_ratio", 4.0),
+        "mlp_ratio":          mlp_ratio,
         "expert_prune_ratio": expert_prune_ratio,
+        "expert_depth":       expert_depth,
+        "model":              fixed.get("model", "deit_small_patch16_224"),
     }
 
     dataset_name = dataset_cfg["dataset"]
@@ -108,7 +120,7 @@ def build_command(run_id, dataset_cfg, num_experts, top_k, expert_prune_ratio,
         sys.executable, "-m", "domainbed.scripts.train",
         "--algorithm",      fixed["algorithm"],
         "--dataset",        dataset_name,
-        "--data_dir",       dataset_cfg["data_dir"],
+        "--data_dir",       os.path.abspath(dataset_cfg["data_dir"]),
         "--output_dir",     output_dir,
         "--sweep_log_dir",  log_dir,
         "--sweep_run_id",   run_id,
@@ -194,19 +206,25 @@ def build_runs_for_dataset(dataset_cfg, cfg, filter_kv):
 
     test_envs    = dataset_cfg["test_envs"]
     dataset_name = dataset_cfg["dataset"]
+    model        = cfg["fixed_params"].get("model", "deit_small_patch16_224")
 
     runs = []
     for combo in combos:
         vals = dict(zip(keys, combo))
-        n, k, pr = vals["num_experts"], vals["top_k"], vals["expert_prune_ratio"]
+        n  = vals["num_experts"]
+        k  = vals["top_k"]
+        pr = vals["expert_prune_ratio"]
+        mr = vals["mlp_ratio"]
+        ed = vals["expert_depth"]
 
-        if not check_constraint(n, k, pr, constraints):
+        if not check_constraint(n, k, pr, mr, ed, constraints):
             continue
 
         # Apply --filter
         skip = False
         for fk, fv in filter_kv.items():
-            actual = {"num_experts": n, "top_k": k, "expert_prune_ratio": pr}.get(fk)
+            actual = {"num_experts": n, "top_k": k, "expert_prune_ratio": pr,
+                      "mlp_ratio": mr, "expert_depth": ed}.get(fk)
             if actual is None:
                 continue
             if isinstance(fv, float):
@@ -219,9 +237,9 @@ def build_runs_for_dataset(dataset_cfg, cfg, filter_kv):
             continue
 
         for env in test_envs:
-            run_id = make_run_id(dataset_name, n, k, pr, env)
+            run_id = make_run_id(dataset_name, n, k, pr, mr, ed, env, model)
             cmd, log_dir, output_dir = build_command(
-                run_id, dataset_cfg, n, k, pr, env, cfg)
+                run_id, dataset_cfg, n, k, pr, mr, ed, env, cfg)
             runs.append((run_id, cmd, log_dir))
 
     return runs

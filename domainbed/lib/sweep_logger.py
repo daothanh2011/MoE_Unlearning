@@ -95,16 +95,29 @@ def _compute_params(model, hparams):
     """
     total_params = sum(p.numel() for p in model.parameters())
 
-    embed_dim           = 384          # DeiT-small
+    # Read embed_dim from the model to support DeiT-Ti (192), S (384), B (768)
+    embed_dim = getattr(model, 'embed_dim', None)
+    if embed_dim is None:
+        # fallback: infer from patch embedding weight shape
+        pe = getattr(model, 'patch_embed', None)
+        embed_dim = pe.proj.weight.shape[0] if pe is not None else 384
     num_moe_layers      = 2            # blocks 8 and 10 in the moe_layers config
     num_experts         = hparams.get("num_experts",       6)
     gate_k              = hparams.get("gate_k",            1)
     mlp_ratio           = hparams.get("mlp_ratio",         4.0)
     expert_prune_ratio  = hparams.get("expert_prune_ratio", 0.0)
+    expert_depth        = hparams.get("expert_depth",      2)
 
     hidden_size = max(1, int(embed_dim * mlp_ratio * (1 - expert_prune_ratio)))
-    inactive    = num_moe_layers * (num_experts - gate_k) * 2 * embed_dim * hidden_size
-    active      = total_params - inactive
+    # Params per expert (weights only):
+    #   fc_first  : embed_dim × hidden_size
+    #   fc_middle : hidden_size × hidden_size  (expert_depth - 2 layers)
+    #   fc_last   : hidden_size × embed_dim
+    params_per_expert = (embed_dim * hidden_size
+                         + (expert_depth - 2) * hidden_size * hidden_size
+                         + hidden_size * embed_dim)
+    inactive = num_moe_layers * (num_experts - gate_k) * params_per_expert
+    active   = total_params - inactive
 
     return total_params, active, hidden_size
 
@@ -288,6 +301,7 @@ class SweepLogger:
             "num_experts":           self.hparams.get("num_experts",       6),
             "gate_k":                self.hparams.get("gate_k",            1),
             "mlp_ratio":             self.hparams.get("mlp_ratio",         4.0),
+            "expert_depth":          self.hparams.get("expert_depth",      2),
             "expert_prune_ratio":    self.hparams.get("expert_prune_ratio", 0.0),
         }
         _append_jsonl(self.expert_stats_path, record)

@@ -196,7 +196,10 @@ class GMOE(Algorithm):
         gate_k       = hparams.get('gate_k',            1)
         mlp_ratio    = hparams.get('mlp_ratio',         4.0)
         prune_ratio  = hparams.get('expert_prune_ratio', 0.0)
-        self.model = vision_transformer.deit_small_patch16_224(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=mlp_ratio, num_experts=num_experts, gate_k=gate_k, prune_ratio=prune_ratio, is_tutel=True, drop_path_rate=0.1, router='cosine_top').cuda()
+        expert_depth = hparams.get('expert_depth',      2)
+        model_name   = hparams.get('model',             'deit_small_patch16_224')
+        model_factory = getattr(vision_transformer, model_name)
+        self.model = model_factory(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=mlp_ratio, num_experts=num_experts, gate_k=gate_k, prune_ratio=prune_ratio, is_tutel=True, drop_path_rate=0.1, router='cosine_top', expert_depth=expert_depth).cuda()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.hparams["lr"], weight_decay=self.hparams['weight_decay'])
 
     def _preprocess(self, x):
