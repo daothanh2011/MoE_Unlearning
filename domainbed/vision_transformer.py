@@ -258,6 +258,12 @@ class DeepExpert(nn.Module):
             nn.Linear(dims[i], dims[i + 1]) for i in range(depth)
         )
         self.dropout = nn.Dropout(dropout)
+        # Middle layers (hidden → hidden) are initialised as identity so the
+        # expert is a near-pass-through at the start of training.  This avoids
+        # the signal distortion caused by random Kaiming init in deeper experts.
+        for layer in self.layers[1:-1]:   # only H×H layers qualify
+            nn.init.eye_(layer.weight)
+            nn.init.zeros_(layer.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers[:-1]:
@@ -312,7 +318,7 @@ class DeepMoELayer(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, cur_depth=0, moe_layers=None, num_experts=6, gate_k=1, prune_ratio=0.0, router='cosine_top', is_tutel=False, index_hook=False, expert_depth=2):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, cur_depth=0, moe_layers=None, num_experts=6, gate_k=1, prune_ratio=0.0, router='cosine_top', is_tutel=False, index_hook=False, expert_depth=2, expert_mlp_ratio=None):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
@@ -321,8 +327,11 @@ class Block(nn.Module):
         self.norm2 = norm_layer(dim)
         self.aux_loss = None
         self.is_moe_layer = False
+        # Dense blocks use mlp_ratio (matches pretrained checkpoint, default 4.0).
+        # MoE expert blocks use expert_mlp_ratio when provided, otherwise fall back to mlp_ratio.
         mlp_hidden_dim = int(dim * mlp_ratio)
-        hidden_size = max(1, int(mlp_hidden_dim * (1 - prune_ratio)))
+        expert_hidden_dim = int(dim * (expert_mlp_ratio if expert_mlp_ratio is not None else mlp_ratio))
+        hidden_size = max(1, int(expert_hidden_dim * (1 - prune_ratio)))
         self.cur_layer = moe_layers[cur_depth] if moe_layers is not None else 'F'
         self.moe_drop = nn.Dropout(0.1)
         self.is_tutel = is_tutel
@@ -381,7 +390,7 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, weight_init='', moe_layers=None, num_experts=6, gate_k=1, prune_ratio=0.0, index_hook=False, router='cosine_top', is_tutel=False, expert_depth=2):
+                 act_layer=None, weight_init='', moe_layers=None, num_experts=6, gate_k=1, prune_ratio=0.0, index_hook=False, router='cosine_top', is_tutel=False, expert_depth=2, expert_mlp_ratio=None):
         """
         Args:
             img_size (int, tuple): input image size
@@ -422,7 +431,7 @@ class VisionTransformer(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
                 attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                cur_depth=i, moe_layers=moe_layers, num_experts=num_experts, gate_k=gate_k, prune_ratio=prune_ratio, index_hook=index_hook, router=router, is_tutel=is_tutel, expert_depth=expert_depth)
+                cur_depth=i, moe_layers=moe_layers, num_experts=num_experts, gate_k=gate_k, prune_ratio=prune_ratio, index_hook=index_hook, router=router, is_tutel=is_tutel, expert_depth=expert_depth, expert_mlp_ratio=expert_mlp_ratio)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
@@ -460,6 +469,15 @@ class VisionTransformer(nn.Module):
         else:
             trunc_normal_(self.cls_token, std=.02)
             self.apply(_init_vit_weights)
+        # Re-apply identity init for DeepExpert middle layers.
+        # self.apply(_init_vit_weights) overwrites them with trunc_normal_;
+        # identity init ensures the extra layers are pass-through at the start of training.
+        for block in self.blocks:
+            if isinstance(getattr(block, 'mlp', None), DeepMoELayer):
+                for expert in block.mlp.experts:
+                    for layer in expert.layers[1:-1]:
+                        nn.init.eye_(layer.weight)
+                        nn.init.zeros_(layer.bias)
 
     def _init_weights(self, m):
         # this fn left here for compat with downstream users
