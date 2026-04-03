@@ -84,21 +84,28 @@ def _get_git_info():
 # Compute-cost helpers
 # ---------------------------------------------------------------------------
 
+_BACKBONE_LABEL = {192: "DeiT-Ti/16", 384: "DeiT-S/16", 768: "DeiT-B/16"}
+
+
 def _compute_params(model, hparams):
     """
-    Returns (total_params, active_params, hidden_size_per_expert).
+    Returns (total_params, active_params, hidden_size_per_expert, embed_dim).
 
     Architecture: moe_layers = ['F']*8 + ['S','F']*2  →  2 MoE ('S') blocks.
-    Inactive expert params  = num_moe_layers * (num_experts - gate_k)
-                              * 2 * embed_dim * hidden_size_per_expert
+    Inactive expert params = num_moe_layers * (num_experts - gate_k) * params_per_expert
     active_params = total_params - inactive_expert_params
+
+    params_per_expert counts weights AND biases for all layers:
+      fc_first  : D*H + H
+      fc_middle : (depth-2) * (H*H + H)
+      fc_last   : H*D + D
+    Verified against actual model param counts (see verify_params.py).
     """
     total_params = sum(p.numel() for p in model.parameters())
 
     # Read embed_dim from the model to support DeiT-Ti (192), S (384), B (768)
     embed_dim = getattr(model, 'embed_dim', None)
     if embed_dim is None:
-        # fallback: infer from patch embedding weight shape
         pe = getattr(model, 'patch_embed', None)
         embed_dim = pe.proj.weight.shape[0] if pe is not None else 384
     num_moe_layers      = 2            # blocks 8 and 10 in the moe_layers config
@@ -109,17 +116,17 @@ def _compute_params(model, hparams):
     expert_depth        = hparams.get("expert_depth",      2)
 
     hidden_size = max(1, int(embed_dim * mlp_ratio * (1 - expert_prune_ratio)))
-    # Params per expert (weights only):
-    #   fc_first  : embed_dim × hidden_size
-    #   fc_middle : hidden_size × hidden_size  (expert_depth - 2 layers)
-    #   fc_last   : hidden_size × embed_dim
-    params_per_expert = (embed_dim * hidden_size
-                         + (expert_depth - 2) * hidden_size * hidden_size
-                         + hidden_size * embed_dim)
+    # Params per expert (weights + biases):
+    #   fc_first  : embed_dim × hidden_size  +  hidden_size (bias)
+    #   fc_middle : hidden_size × hidden_size  +  hidden_size (bias)  [×(depth-2)]
+    #   fc_last   : hidden_size × embed_dim  +  embed_dim (bias)
+    params_per_expert = (embed_dim * hidden_size + hidden_size
+                         + (expert_depth - 2) * (hidden_size * hidden_size + hidden_size)
+                         + hidden_size * embed_dim + embed_dim)
     inactive = num_moe_layers * (num_experts - gate_k) * params_per_expert
     active   = total_params - inactive
 
-    return total_params, active, hidden_size
+    return total_params, active, hidden_size, embed_dim
 
 
 # ---------------------------------------------------------------------------
@@ -162,9 +169,10 @@ class SweepLogger:
 
         # compute-cost fields
         if model is not None:
-            self.total_params, self.active_params, self.hidden_size = _compute_params(model, hparams)
+            self.total_params, self.active_params, self.hidden_size, self.embed_dim = \
+                _compute_params(model, hparams)
         else:
-            self.total_params = self.active_params = self.hidden_size = None
+            self.total_params = self.active_params = self.hidden_size = self.embed_dim = None
 
         # best-val tracker
         self._best_val_acc   = -1.0
@@ -180,8 +188,9 @@ class SweepLogger:
         """Write hparams.json at run start."""
         doc = dict(self.hparams)
         doc["run_id"]                 = self.run_id
-        doc["backbone"]               = "DeiT-S/16"
-        doc["model_dim"]              = 384
+        embed_dim = self.embed_dim if self.embed_dim is not None else 384
+        doc["backbone"]               = _BACKBONE_LABEL.get(embed_dim, f"DeiT-{embed_dim}d/16")
+        doc["model_dim"]              = embed_dim
         doc["hidden_size_per_expert"] = self.hidden_size
         if self.total_params is not None:
             doc["total_params"]            = self.total_params
