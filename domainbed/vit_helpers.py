@@ -348,8 +348,31 @@ def load_pretrained(model, default_cfg=None, num_classes=1000, in_chans=3, filte
                         if model_bias.dim() == 2:  # pruned model stores bias as [N, H]
                             stacked_vit_mlp_bias = stacked_vit_mlp_bias[:, 0, :model_bias.shape[1]].contiguous()
                         state_dict[f'blocks.{i}.mlp.experts.batched_fc{r}_bias'] = stacked_vit_mlp_bias
-                # else: model hidden > pretrained (mlp_ratio > 4.0) — skip insertion,
-                # experts keep random init; load_state_dict(strict=False) ignores missing keys
+                else:
+                    # model hidden > pretrained (expert_mlp_ratio > 4.0)
+                    # Partial pretrained copy: fill first hidden_dim rows from pretrained,
+                    # Kaiming for extra rows (fc1), zero for extra rows (fc2 — silent start).
+                    bfc1 = block.mlp.experts.batched_fc1_w.data  # (N, model_hidden, D)
+                    bfc2 = block.mlp.experts.batched_fc2_w.data  # (N, model_hidden, D)
+                    # fc1: copy pretrained rows, Kaiming for extra
+                    bfc1[:, :hidden_dim, :] = fc1_w               # (N, hidden_dim, D)
+                    nn.init.kaiming_uniform_(bfc1[:, hidden_dim:, :], a=math.sqrt(5))
+                    # fc2 (stored transposed as (N, H, D)): copy pretrained rows, zero extra
+                    bfc2[:, :hidden_dim, :] = fc2_w               # (N, hidden_dim, D)
+                    bfc2[:, hidden_dim:, :].zero_()
+                    # Write back into state_dict for load_state_dict to pick up
+                    state_dict[f'blocks.{i}.mlp.experts.batched_fc1_w'] = bfc1
+                    state_dict[f'blocks.{i}.mlp.experts.batched_fc2_w'] = bfc2
+                    # biases: copy pretrained bias (dim=hidden_dim), zero for extra
+                    for r, h_dim in [(1, hidden_dim), (2, input_dim)]:
+                        pre_b = state_dict[f'blocks.{i}.mlp.fc{r}.bias']  # (h_dim,)
+                        model_bias = getattr(block.mlp.experts, f'batched_fc{r}_bias')
+                        new_b = torch.zeros_like(model_bias)
+                        if new_b.dim() == 3:   # (N, 1, H)
+                            new_b[:, 0, :h_dim] = pre_b.unsqueeze(0).expand(num_experts, -1)
+                        else:                   # (N, H)
+                            new_b[:, :h_dim] = pre_b.unsqueeze(0).expand(num_experts, -1)
+                        state_dict[f'blocks.{i}.mlp.experts.batched_fc{r}_bias'] = new_b
             elif isinstance(block.mlp.experts, nn.ModuleList):
                 # --- DeepMoELayer experts (expert_depth >= 3) ---
                 # Load pretrained fc1/fc2 into the first and last layer of each expert.
@@ -367,7 +390,18 @@ def load_pretrained(model, default_cfg=None, num_classes=1000, in_chans=3, filte
                         expert.layers[0].bias.data.copy_(fc1_b[:model_h].contiguous())
                         expert.layers[-1].weight.data.copy_(fc2_w[:, :model_h].contiguous())
                         expert.layers[-1].bias.data.copy_(fc2_b.contiguous())
-                    # else: model hidden > pretrained (mlp_ratio > 4.0) — keep random init
+                    else:
+                        # model hidden > pretrained (expert_mlp_ratio > 4.0)
+                        # fc_first (D→H): copy first pretrained_h rows, Kaiming for extra rows
+                        expert.layers[0].weight.data[:pretrained_h].copy_(fc1_w.contiguous())
+                        nn.init.kaiming_uniform_(expert.layers[0].weight.data[pretrained_h:], a=math.sqrt(5))
+                        expert.layers[0].bias.data[:pretrained_h].copy_(fc1_b.contiguous())
+                        expert.layers[0].bias.data[pretrained_h:].zero_()
+                        # fc_last (H→D): copy first pretrained_h cols, zero for extra cols
+                        # (zero "silent start" — new neurons contribute nothing initially)
+                        expert.layers[-1].weight.data[:, :pretrained_h].copy_(fc2_w.contiguous())
+                        expert.layers[-1].weight.data[:, pretrained_h:].zero_()
+                        expert.layers[-1].bias.data.copy_(fc2_b.contiguous())
 
     key_list = list(state_dict.keys())
     for item in removed_index:
