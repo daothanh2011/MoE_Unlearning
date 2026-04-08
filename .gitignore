@@ -8,6 +8,12 @@ train_output/
 sweep/logs/
 sweep/results/
 sweep/figures/
+sweep/sweep_status.json
+
+# Multi-dataset benchmark run outputs (keep source files, ignore artifacts)
+multi_dataset/*/
+multi_dataset/results/
+multi_dataset/benchmark_status.json
 
 # General logs
 logs/
@@ -30,7 +36,7 @@ build/
 
 # Experiment tracking
 wandb/
-
+exps/eval_outputs/
 # Misc
 *.DS_Store
 .env

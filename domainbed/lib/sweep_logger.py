@@ -156,6 +156,7 @@ class SweepLogger:
         self.run_id   = run_id
         self.hparams  = hparams
         self.args     = args
+        self._algorithm_name = getattr(args, 'algorithm', None)
         self.start_ts = datetime.now(timezone.utc)
         self.start_t  = time.time()
 
@@ -188,6 +189,8 @@ class SweepLogger:
         """Write hparams.json at run start."""
         doc = dict(self.hparams)
         doc["run_id"]                 = self.run_id
+        if hasattr(self, '_algorithm_name') and self._algorithm_name:
+            doc["algorithm"]          = self._algorithm_name
         embed_dim = self.embed_dim if self.embed_dim is not None else 384
         doc["backbone"]               = _BACKBONE_LABEL.get(embed_dim, f"DeiT-{embed_dim}d/16")
         doc["model_dim"]              = embed_dim
@@ -293,15 +296,20 @@ class SweepLogger:
         """
         Append MoE diagnostics to expert_stats.jsonl.
         Collects aux_loss per MoE block (only l_aux is accessible via Tutel).
+        Non-MoE algorithms (no `model.blocks`) get an empty record so the
+        sweep logger stays compatible across algorithms.
         """
         layer_aux = []
-        for block in algorithm.model.blocks:
-            al = getattr(block, "aux_loss", None)
-            if al is not None:
-                try:
-                    layer_aux.append(round(float(al), 6))
-                except Exception:
-                    pass
+        moe_model = getattr(algorithm, "model", None)
+        blocks = getattr(moe_model, "blocks", None) if moe_model is not None else None
+        if blocks is not None:
+            for block in blocks:
+                al = getattr(block, "aux_loss", None)
+                if al is not None:
+                    try:
+                        layer_aux.append(round(float(al), 6))
+                    except Exception:
+                        pass
 
         record = {
             "step":                  step,

@@ -1,0 +1,96 @@
+benchmark_name: "dg_table_benchmark"
+description: "Multi-algorithm × multi-dataset DG benchmark replicating GMoE paper Table 2"
+
+# --- Trial / training settings (default hparams, no random search) ---
+seeds: [0, 1, 2]
+steps: 5000
+checkpoint_freq: 500
+
+# --- Datasets (must match yaml files in sweep/configs/) ---
+datasets:
+  - PACS
+  - OfficeHome
+  # - TerraIncognita
+  # - DomainNet
+
+# --- Output ---
+output_root: "multi_dataset"
+status_file: "multi_dataset/benchmark_status.json"
+
+# --- Algorithm matrix ---
+# Each entry produces a row in the final table.
+# `name`      : unique label used for output paths and the table row.
+# `algorithm` : class name in domainbed/algorithms.py.
+# `model`     : backbone — 'resnet50' or a ViT factory in vision_transformer.py
+#               (e.g. 'deit_small_patch16_224').
+# `hparams`   : extra hparams merged into --hparams JSON (override defaults).
+algorithms:
+  - name: ERM_ResNet50
+    algorithm: ERM
+    model: resnet50
+    hparams: {}
+
+  - name: IRM
+    algorithm: IRM
+    model: deit_small_patch16_224
+    hparams: {}
+
+  - name: DANN
+    algorithm: DANN
+    model: deit_small_patch16_224
+    hparams: {}
+
+  - name: CORAL
+    algorithm: CORAL
+    model: deit_small_patch16_224
+    hparams: {}
+
+  - name: MMD
+    algorithm: MMD
+    model: deit_small_patch16_224
+    hparams: {}
+
+  - name: Fish
+    algorithm: Fish
+    model: deit_small_patch16_224
+    hparams: {}
+
+  - name: Fishr
+    algorithm: Fishr
+    model: deit_small_patch16_224
+    hparams: {}
+
+  - name: ERM_ViTS16
+    algorithm: ERM
+    model: deit_small_patch16_224
+    hparams: {}
+
+  - name: GroupDRO
+    algorithm: GroupDRO
+    model: deit_small_patch16_224
+    hparams: {}
+
+  - name: VREx
+    algorithm: VREx
+    model: deit_small_patch16_224
+    hparams: {}
+
+  - name: GMOE
+    algorithm: GMOE
+    model: deit_small_patch16_224
+    hparams:
+      num_experts: 6
+      gate_k: 1
+      mlp_ratio: 4
+      expert_depth: 2
+
+  - name: GMoEOMoE
+    algorithm: GMoEOMoE
+    model: deit_small_patch16_224
+    hparams:
+      num_experts: 6
+      gate_k: 2
+      mlp_ratio: 4
+      expert_depth: 2
+      use_omoe: true
+      use_balance_loss: true

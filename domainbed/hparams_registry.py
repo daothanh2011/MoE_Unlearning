@@ -31,6 +31,9 @@ def _hparams(algorithm, dataset, random_seed):
     _hparam('data_augmentation', True, lambda r: True)
     _hparam('resnet18', False, lambda r: False)
     _hparam('resnet_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))
+    # Backbone selector — 'resnet50' (default) or a ViT factory name like
+    # 'deit_small_patch16_224'. Read by networks.Featurizer().
+    _hparam('model', 'resnet50', lambda r: 'resnet50')
     _hparam('class_balanced', False, lambda r: False)
     # TODO: nonlinear classifiers disabled
     _hparam('nonlinear_classifier', False,
@@ -168,13 +171,15 @@ def _hparams(algorithm, dataset, random_seed):
     elif algorithm in ['DANN', 'CDANN']:
         _hparam('weight_decay_g', 0., lambda r: 10 ** r.uniform(-6, -2))
 
-    if 'GMOE' in algorithm:
+    if algorithm in ('GMOE', 'GMoEOMoE'):
         _hparam('num_experts',        6,                        lambda r: 6)
         _hparam('gate_k',             1,                        lambda r: 1)
         _hparam('mlp_ratio',          4.0,                      lambda r: 4.0)
         _hparam('expert_depth',       2,                        lambda r: 2)
         _hparam('expert_prune_ratio', 0.0,                      lambda r: 0.0)
         _hparam('model',              'deit_small_patch16_224', lambda r: 'deit_small_patch16_224')
+        _hparam('use_omoe',           False,                    lambda r: False)
+        _hparam('use_balance_loss',   False,                    lambda r: False)
 
         if dataset == 'VLCS':
             _hparam('lr', 3e-5, lambda r: 10 ** r.uniform(-4.5, -2.5))
