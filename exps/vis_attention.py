@@ -33,7 +33,7 @@ import numpy as np
 from PIL import Image
 from collections import OrderedDict
 
-sys.path.append("/mnt/lustre/bli/projects/EIL")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from domainbed import vision_transformer
 
 
@@ -106,7 +106,7 @@ if __name__ == '__main__':
                         help="Path to pretrained weights to load.")
     parser.add_argument("--checkpoint_key", default="teacher", type=str,
                         help='Key to use in the checkpoint (example: "teacher")')
-    parser.add_argument("--image_path", default="/mnt/lustre/bli/data/domain_net/real", type=str, help="Path of the image to load.")
+    parser.add_argument("--image_path", default="./domainbed/data/domain_net/real", type=str, help="Path of the image to load.")
     parser.add_argument("--image_size", default=(224, 224), type=int, nargs="+", help="Resize image.")
     parser.add_argument('--output_dir', default='./attn_output_vit', help='Path where to save visualizations.')
     parser.add_argument("--threshold", type=float, default=None, help="""We visualize masks obtained by thresholding the self-attention maps to keep xx% of the mass.""")
@@ -131,7 +131,7 @@ if __name__ == '__main__':
 
     image_list = []
 
-    # for filename in glob.glob("/mnt/lustre/bli/data/domain_net/real/**/*.jpg"):
+    # for filename in glob.glob("./domainbed/data/domain_net/real/**/*.jpg"):
     #     image_list.append(filename)
     #
     # random.shuffle(image_list)

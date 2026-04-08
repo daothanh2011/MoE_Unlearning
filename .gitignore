@@ -1,0 +1,43 @@
+# Datasets
+domainbed/data/
+
+# Training outputs
+train_output/
+
+# Sweep logs and results
+sweep/logs/
+sweep/results/
+sweep/figures/
+sweep/sweep_status.json
+
+# Multi-dataset benchmark run outputs (keep source files, ignore artifacts)
+multi_dataset/*/
+multi_dataset/results/
+multi_dataset/benchmark_status.json
+
+# General logs
+logs/
+
+# Reports
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Experiment tracking
+wandb/
+exps/eval_outputs/
+# Misc
+*.DS_Store
+.env
+*.log

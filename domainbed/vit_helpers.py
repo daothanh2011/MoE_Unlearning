@@ -19,7 +19,10 @@ from timm.models.hub import has_hf_hub, download_cached_file, load_state_dict_fr
 from timm.models.layers import Conv2dSame, Linear
 from timm.models.vision_transformer import VisionTransformer, resize_pos_embed
 
-import tutel.impls.moe_layer as moe_layer
+try:
+    import tutel.impls.moe_layer as moe_layer
+except ImportError:
+    moe_layer = None
 
 _logger = logging.getLogger(__name__)
 
@@ -322,23 +325,104 @@ def load_pretrained(model, default_cfg=None, num_classes=1000, in_chans=3, filte
     for i, block in enumerate(model.blocks.children()):
         if hasattr(block.mlp, 'experts'):
             removed_index.append(i)
-            if isinstance(block.mlp, moe_layer.MOELayer):
+            if moe_layer is not None and isinstance(block.mlp, moe_layer.MOELayer):
+                # --- Tutel 2-layer FFN experts (expert_depth == 2) ---
                 num_experts = block.mlp.num_global_experts
                 ## fc1
                 hidden_dim, input_dim = state_dict[f'blocks.{i}.mlp.fc1.weight'].shape
-                state_dict[f'blocks.{i}.mlp.experts.batched_fc1_w'] = state_dict[f'blocks.{i}.mlp.fc1.weight'].expand(num_experts, hidden_dim, input_dim)
-                state_dict[f'blocks.{i}.mlp.experts.batched_fc2_w'] = state_dict[f'blocks.{i}.mlp.fc2.weight'].expand(num_experts, input_dim, hidden_dim).permute(0, 2, 1)
-                for r in range(1, 3):
-                    hidden_dim, input_dim = state_dict[f'blocks.{i}.mlp.fc{r}.weight'].shape
-                    vit_mlp_bias = state_dict[f'blocks.{i}.mlp.fc{r}.bias']
-                    stacked_vit_mlp_bias = vit_mlp_bias.expand(num_experts, 1, hidden_dim)
-                    state_dict[f'blocks.{i}.mlp.experts.batched_fc{r}_bias'] = stacked_vit_mlp_bias
+                # model_hidden may be smaller than hidden_dim when expert_prune_ratio > 0
+                model_hidden = block.mlp.experts.batched_fc1_w.shape[1]
+                fc1_w = state_dict[f'blocks.{i}.mlp.fc1.weight'].expand(num_experts, hidden_dim, input_dim)
+                fc2_w = state_dict[f'blocks.{i}.mlp.fc2.weight'].expand(num_experts, input_dim, hidden_dim).permute(0, 2, 1)
+                if model_hidden <= hidden_dim:
+                    # model hidden ≤ pretrained: copy (possibly pruned) slice
+                    fc1_w = fc1_w[:, :model_hidden, :].contiguous()
+                    fc2_w = fc2_w[:, :model_hidden, :].contiguous()
+                    state_dict[f'blocks.{i}.mlp.experts.batched_fc1_w'] = fc1_w
+                    state_dict[f'blocks.{i}.mlp.experts.batched_fc2_w'] = fc2_w
+                    for r in range(1, 3):
+                        h_dim, _ = state_dict[f'blocks.{i}.mlp.fc{r}.weight'].shape
+                        vit_mlp_bias = state_dict[f'blocks.{i}.mlp.fc{r}.bias']
+                        stacked_vit_mlp_bias = vit_mlp_bias.expand(num_experts, 1, h_dim)
+                        model_bias = getattr(block.mlp.experts, f'batched_fc{r}_bias')
+                        if model_bias.dim() == 2:  # pruned model stores bias as [N, H]
+                            stacked_vit_mlp_bias = stacked_vit_mlp_bias[:, 0, :model_bias.shape[1]].contiguous()
+                        state_dict[f'blocks.{i}.mlp.experts.batched_fc{r}_bias'] = stacked_vit_mlp_bias
+                else:
+                    # model hidden > pretrained (expert_mlp_ratio > 4.0)
+                    # Partial pretrained copy: fill first hidden_dim rows from pretrained,
+                    # Kaiming for extra rows (fc1), zero for extra rows (fc2 — silent start).
+                    bfc1 = block.mlp.experts.batched_fc1_w.data  # (N, model_hidden, D)
+                    bfc2 = block.mlp.experts.batched_fc2_w.data  # (N, model_hidden, D)
+                    # fc1: copy pretrained rows, Kaiming for extra
+                    bfc1[:, :hidden_dim, :] = fc1_w               # (N, hidden_dim, D)
+                    nn.init.kaiming_uniform_(bfc1[:, hidden_dim:, :], a=math.sqrt(5))
+                    # fc2 (stored transposed as (N, H, D)): copy pretrained rows, zero extra
+                    bfc2[:, :hidden_dim, :] = fc2_w               # (N, hidden_dim, D)
+                    bfc2[:, hidden_dim:, :].zero_()
+                    # Write back into state_dict for load_state_dict to pick up
+                    state_dict[f'blocks.{i}.mlp.experts.batched_fc1_w'] = bfc1
+                    state_dict[f'blocks.{i}.mlp.experts.batched_fc2_w'] = bfc2
+                    # biases: copy pretrained bias (dim=hidden_dim), zero for extra
+                    for r, h_dim in [(1, hidden_dim), (2, input_dim)]:
+                        pre_b = state_dict[f'blocks.{i}.mlp.fc{r}.bias']  # (h_dim,)
+                        model_bias = getattr(block.mlp.experts, f'batched_fc{r}_bias')
+                        new_b = torch.zeros_like(model_bias)
+                        if new_b.dim() == 3:   # (N, 1, H)
+                            new_b[:, 0, :h_dim] = pre_b.unsqueeze(0).expand(num_experts, -1)
+                        else:                   # (N, H)
+                            new_b[:, :h_dim] = pre_b.unsqueeze(0).expand(num_experts, -1)
+                        state_dict[f'blocks.{i}.mlp.experts.batched_fc{r}_bias'] = new_b
+            elif isinstance(block.mlp.experts, nn.ModuleList):
+                # --- DeepMoELayer experts (expert_depth >= 3) ---
+                # Load pretrained fc1/fc2 into the first and last layer of each expert.
+                # Middle layers (index 1 … depth-2) are left with random init.
+                fc1_w    = state_dict[f'blocks.{i}.mlp.fc1.weight']   # (H, D)
+                fc1_b    = state_dict[f'blocks.{i}.mlp.fc1.bias']     # (H,)
+                fc2_w    = state_dict[f'blocks.{i}.mlp.fc2.weight']   # (D, H)
+                fc2_b    = state_dict[f'blocks.{i}.mlp.fc2.bias']     # (D,)
+                pretrained_h = fc1_w.shape[0]
+                for expert in block.mlp.experts:
+                    model_h = expert.layers[0].weight.shape[0]         # actual hidden
+                    if model_h <= pretrained_h:
+                        # model hidden ≤ pretrained: copy (possibly pruned) slice
+                        expert.layers[0].weight.data.copy_(fc1_w[:model_h].contiguous())
+                        expert.layers[0].bias.data.copy_(fc1_b[:model_h].contiguous())
+                        expert.layers[-1].weight.data.copy_(fc2_w[:, :model_h].contiguous())
+                        expert.layers[-1].bias.data.copy_(fc2_b.contiguous())
+                    else:
+                        # model hidden > pretrained (expert_mlp_ratio > 4.0)
+                        # fc_first (D→H): copy first pretrained_h rows, Kaiming for extra rows
+                        expert.layers[0].weight.data[:pretrained_h].copy_(fc1_w.contiguous())
+                        nn.init.kaiming_uniform_(expert.layers[0].weight.data[pretrained_h:], a=math.sqrt(5))
+                        expert.layers[0].bias.data[:pretrained_h].copy_(fc1_b.contiguous())
+                        expert.layers[0].bias.data[pretrained_h:].zero_()
+                        # fc_last (H→D): copy first pretrained_h cols, zero for extra cols
+                        # (zero "silent start" — new neurons contribute nothing initially)
+                        expert.layers[-1].weight.data[:, :pretrained_h].copy_(fc2_w.contiguous())
+                        expert.layers[-1].weight.data[:, pretrained_h:].zero_()
+                        expert.layers[-1].bias.data.copy_(fc2_b.contiguous())
 
     key_list = list(state_dict.keys())
     for item in removed_index:
         for key in key_list:
             if f'blocks.{item}.mlp.fc' in key:
                 state_dict.pop(key)
+
+    # Remove any remaining blocks.*.mlp.fc* keys whose shape doesn't match the
+    # current model (e.g. dense blocks when mlp_ratio != pretrained value of 4.0).
+    # load_state_dict raises RuntimeError on shape mismatches even with strict=False.
+    named_params = dict(model.named_parameters())
+    key_list = list(state_dict.keys())
+    for key in key_list:
+        if '.mlp.fc' not in key:
+            continue
+        if key not in state_dict:
+            continue
+        model_param = named_params.get(key)
+        if model_param is not None and state_dict[key].shape != model_param.shape:
+            state_dict.pop(key)
+
     msg = model.load_state_dict(state_dict, strict=strict)
     print(msg)
 

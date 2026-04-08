@@ -1,0 +1,4 @@
+dataset:      "ColoredMNIST"
+data_dir:     "./domainbed/data/MNIST/"
+test_envs:    [0, 1, 2]
+domain_names: ["+90pct", "+80pct", "-90pct"]

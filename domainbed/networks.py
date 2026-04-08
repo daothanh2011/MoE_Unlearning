@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torchvision.models
 
 from domainbed.lib import wide_resnet
+from domainbed import vision_transformer
 
 
 def remove_batch_norm_from_resnet(model):
@@ -194,6 +195,25 @@ class PositionalEmbedding1D(nn.Module):
         return x + self.pos_embedding
     
 
+class ViTFeaturizer(nn.Module):
+    """Vanilla ViT (DeiT) featurizer — no MoE. Returns CLS token embedding."""
+    def __init__(self, model_name, hparams=None):
+        super().__init__()
+        if not hasattr(vision_transformer, model_name):
+            raise ValueError(f"Unknown ViT model: {model_name}")
+        factory = getattr(vision_transformer, model_name)
+        # num_classes=0 → head is Identity, so forward() returns CLS features.
+        # moe_layers=None → all blocks use the dense MLP path (no MoE).
+        self.network = factory(pretrained=True, num_classes=0)
+        self.n_outputs = self.network.embed_dim
+        self.hparams = hparams or {}
+
+    def forward(self, x):
+        # Inputs are (B,3,224,224) for our DG datasets; ViT.forward returns CLS embedding
+        # because num_classes=0 makes self.head an Identity.
+        return self.network(x)
+
+
 def Featurizer(input_shape, hparams=None):
     """Auto-select an appropriate featurizer for the given input shape."""
     if len(input_shape) == 1:
@@ -203,6 +223,9 @@ def Featurizer(input_shape, hparams=None):
     elif input_shape[1:3] == (32, 32):
         return wide_resnet.Wide_ResNet(input_shape, 16, 2, 0.)
     elif input_shape[1:3] == (224, 224):
+        model_name = (hparams or {}).get('model', '')
+        if model_name.startswith('deit_') or model_name.startswith('vit_'):
+            return ViTFeaturizer(model_name, hparams)
         return ResNet(input_shape, hparams)
     else:
         raise NotImplementedError

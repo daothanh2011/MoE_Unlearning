@@ -41,9 +41,13 @@ from vit_helpers import build_model_with_cfg, named_apply, adapt_input_conv
 from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
 from timm.models.registry import register_model
 
+tutel_moe = None
 if float(torch.version.cuda) > 10.1:
     # tutel only works above cuda 10.1
-    from tutel import moe as tutel_moe
+    try:
+        from tutel import moe as tutel_moe
+    except ImportError:
+        tutel_moe = None
 
 from domainbed.moe_layer import TransparentMoELayer
 
@@ -236,9 +240,133 @@ class Attention(nn.Module):
             return x
 
 
+class DeepExpert(nn.Module):
+    """Expert FFN with configurable depth.
+
+    depth=2 matches the standard Tutel 'ffn' expert (fc1 → act → fc2).
+    depth>2 adds hidden-to-hidden middle layers between fc1 and fc2.
+
+    Architecture for depth N:
+        fc0 : model_dim  → hidden_size   (expand)
+        fc1…fc(N-2) : hidden_size → hidden_size  (N-2 middle layers)
+        fc(N-1) : hidden_size → model_dim  (compress)
+    """
+
+    def __init__(self, model_dim: int, hidden_size: int, depth: int, dropout: float = 0.1):
+        super().__init__()
+        assert depth >= 2, "Expert must have at least 2 linear layers"
+        dims = [model_dim] + [hidden_size] * (depth - 1) + [model_dim]
+        self.layers = nn.ModuleList(
+            nn.Linear(dims[i], dims[i + 1]) for i in range(depth)
+        )
+        self.dropout = nn.Dropout(dropout)
+        # Middle layers (hidden → hidden) are initialised as identity so the
+        # expert is a near-pass-through at the start of training.  This avoids
+        # the signal distortion caused by random Kaiming init in deeper experts.
+        for layer in self.layers[1:-1]:   # only H×H layers qualify
+            nn.init.eye_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers[:-1]:
+            x = self.dropout(F.gelu(layer(x)))
+        return self.layers[-1](x)
+
+
+def gram_schmidt(E: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Modified Gram-Schmidt orthogonalization on k expert output vectors per token.
+
+    Args:
+        E: [T, k, D] — T tokens, k active expert outputs, D model dim.
+           Assumes E[:, 0, :] is the highest-weight expert (topk returns descending order),
+           so the most-trusted expert anchors the orthogonal basis.
+    Returns:
+        E_orth [T, k, D]: mutually orthogonal (not unit-normalized) vectors.
+                          The first vector is kept as-is; each subsequent vector has
+                          all projections onto prior basis vectors subtracted out.
+
+    Differentiability: all ops are differentiable; autograd flows through normally.
+    k=1 case: loop body never executes — returns E unchanged (true no-op).
+    """
+    vecs = list(E.unbind(dim=1))   # k tensors of shape [T, D]
+    orth = [vecs[0]]
+    for j in range(1, len(vecs)):
+        v = vecs[j]
+        for u in orth:
+            proj = (v * u).sum(-1, keepdim=True) / (u * u).sum(-1, keepdim=True).clamp(min=eps) * u
+            v = v - proj
+        orth.append(v)
+    return torch.stack(orth, dim=1)   # [T, k, D]
+
+
+class DeepMoELayer(nn.Module):
+    """Custom MoE layer with configurable expert depth (depth > 2).
+
+    Drop-in replacement for tutel_moe.moe_layer in Block when expert_depth > 2.
+    Uses cosine-similarity top-k routing to match the existing 'cosine_top' router.
+    Sets self.l_aux = 0 after each forward pass so Block.forward works unchanged.
+    """
+
+    def __init__(self, model_dim: int, num_experts: int, hidden_size: int,
+                 gate_k: int, depth: int, dropout: float = 0.1,
+                 use_omoe: bool = False, use_balance_loss: bool = False):
+        super().__init__()
+        self.gate_k           = gate_k
+        self.num_experts      = num_experts
+        self.use_omoe         = use_omoe
+        self.use_balance_loss = use_balance_loss
+        self.experts = nn.ModuleList(
+            DeepExpert(model_dim, hidden_size, depth, dropout)
+            for _ in range(num_experts)
+        )
+        # Cosine gate: project normalized input to per-expert logits
+        self.gate_proj = nn.Linear(model_dim, num_experts, bias=False)
+        # Mirrors tutel's l_aux attribute; value set during forward
+        self.l_aux = torch.tensor(0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, S, D)
+        B, S, D = x.shape
+        x_flat = x.reshape(-1, D)                                          # (T, D)  T = B*S
+        T = x_flat.shape[0]
+
+        # Cosine top-k routing (topk returns descending order: ki=0 = highest-weight expert)
+        logits             = self.gate_proj(F.normalize(x_flat, dim=-1))   # (T, E)
+        topk_vals, topk_idx = logits.topk(self.gate_k, dim=-1)             # (T, k)
+        gates              = F.softmax(topk_vals, dim=-1)                  # (T, k)
+
+        # Collect raw expert outputs into E_raw[T, k, D]
+        E_raw = torch.zeros(T, self.gate_k, D, device=x.device, dtype=x.dtype)
+        for ki in range(self.gate_k):
+            idx = topk_idx[:, ki]                                          # (T,)
+            for ei in range(self.num_experts):
+                mask = (idx == ei)
+                if mask.any():
+                    E_raw[mask, ki] = self.experts[ei](x_flat[mask])
+
+        # OMoE: Gram-Schmidt orthogonalization (no-op when gate_k == 1)
+        if self.use_omoe and self.gate_k > 1:
+            E_raw = gram_schmidt(E_raw)                                    # [T, k, D]
+
+        # Weighted aggregation
+        out = (gates.unsqueeze(-1) * E_raw).sum(dim=1)                     # (T, D)
+
+        # Optional load-balance auxiliary loss (importance CV²)
+        if self.use_balance_loss:
+            # route_prob[t, e] = gate weight if token t chose expert e, else 0
+            route_prob = torch.zeros(T, self.num_experts, device=x.device, dtype=gates.dtype)
+            route_prob.scatter_(1, topk_idx, gates)                        # [T, N]
+            imp = route_prob.sum(dim=0)                                    # [N]
+            self.l_aux = imp.var() / (imp.mean() ** 2 + 1e-10)            # CV²
+        else:
+            self.l_aux = torch.tensor(0.0, device=x.device)
+
+        return out.reshape(B, S, D)
+
+
 class Block(nn.Module):
 
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, cur_depth=0, moe_layers=None, num_experts=6, router='cosine_top', is_tutel=False, index_hook=False, top_k=1):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, cur_depth=0, moe_layers=None, num_experts=6, gate_k=1, prune_ratio=0.0, router='cosine_top', is_tutel=False, index_hook=False, expert_depth=2, expert_mlp_ratio=None, use_omoe=False, use_balance_loss=False, force_custom_moe=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
@@ -249,36 +377,37 @@ class Block(nn.Module):
         self.routing_scores = None
         self.expert_outputs = None
         self.is_moe_layer = False
+        # Dense blocks use mlp_ratio (matches pretrained checkpoint, default 4.0).
+        # MoE expert blocks use expert_mlp_ratio when provided, otherwise fall back to mlp_ratio.
         mlp_hidden_dim = int(dim * mlp_ratio)
+        expert_hidden_dim = int(dim * (expert_mlp_ratio if expert_mlp_ratio is not None else mlp_ratio))
+        hidden_size = max(1, int(expert_hidden_dim * (1 - prune_ratio)))
         self.cur_layer = moe_layers[cur_depth] if moe_layers is not None else 'F'
         self.moe_drop = nn.Dropout(0.1)
         self.is_tutel = is_tutel
         self.aux_loss_weights = 0.01
         if self.cur_layer == 'S':
-            if is_tutel:
-                # Original Tutel path — routing_scores/expert_outputs remain None
+            if expert_depth == 2 and not force_custom_moe:
+                # Standard Tutel 2-layer FFN expert path (unchanged)
+                if tutel_moe is None:
+                    raise ImportError("Tutel is required for expert_depth=2 but is not installed.")
                 self.mlp = tutel_moe.moe_layer(
-                    gate_type={'type': router, 'k': top_k, 'fp32_gate': True, 'gate_noise': 1.0, 'capacity_factor': 1.5},
+                    gate_type={'type': router, 'k': gate_k, 'fp32_gate': True, 'gate_noise': 1.0, 'capacity_factor': 1.5},
                     experts={'type': 'ffn', 'count_per_node': num_experts,
-                             'hidden_size_per_expert': mlp_hidden_dim,
+                             'hidden_size_per_expert': hidden_size,
                              'activation_fn': lambda x: self.moe_drop(F.gelu(x))},
                     model_dim=dim,
                     batch_prioritized_routing=True,
                     is_gshard_loss=False,
                 )
             else:
-                # Transparent path — exposes routing_scores and expert_outputs for Lo/Lv
-                self.mlp = TransparentMoELayer(
-                    model_dim=dim,
-                    n_experts=num_experts,
-                    hidden_size_per_expert=mlp_hidden_dim,
-                    top_k=top_k,
-                    capacity_factor=1.5,
-                    gate_noise=1.0,
-                    proj_dim=256,
-                    init_temperature=0.5,
-                    fp32_gate=True,
-                    dropout=0.1,
+                # Custom PyTorch MoE path: handles depth>=3, and depth==2 when force_custom_moe=True
+                self.mlp = DeepMoELayer(
+                    model_dim=dim, num_experts=num_experts,
+                    hidden_size=hidden_size, gate_k=gate_k,
+                    depth=expert_depth, dropout=0.1,
+                    use_omoe=use_omoe,
+                    use_balance_loss=use_balance_loss,
                 )
         else:
             self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
@@ -316,7 +445,8 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, weight_init='', moe_layers=None, num_experts=6, index_hook=False, router='cosine_top', is_tutel=False, moe_top_k=1):
+                 act_layer=None, weight_init='', moe_layers=None, num_experts=6, gate_k=1, prune_ratio=0.0, index_hook=False, router='cosine_top', is_tutel=False, expert_depth=2, expert_mlp_ratio=None,
+                 use_omoe=False, use_balance_loss=False, force_custom_moe=False):
         """
         Args:
             img_size (int, tuple): input image size
@@ -357,8 +487,8 @@ class VisionTransformer(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
                 attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                cur_depth=i, moe_layers=moe_layers, num_experts=num_experts, index_hook=index_hook, router=router,
-                is_tutel=is_tutel, top_k=moe_top_k)
+                cur_depth=i, moe_layers=moe_layers, num_experts=num_experts, gate_k=gate_k, prune_ratio=prune_ratio, index_hook=index_hook, router=router, is_tutel=is_tutel, expert_depth=expert_depth, expert_mlp_ratio=expert_mlp_ratio,
+                use_omoe=use_omoe, use_balance_loss=use_balance_loss, force_custom_moe=force_custom_moe)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
@@ -396,6 +526,15 @@ class VisionTransformer(nn.Module):
         else:
             trunc_normal_(self.cls_token, std=.02)
             self.apply(_init_vit_weights)
+        # Re-apply identity init for DeepExpert middle layers.
+        # self.apply(_init_vit_weights) overwrites them with trunc_normal_;
+        # identity init ensures the extra layers are pass-through at the start of training.
+        for block in self.blocks:
+            if isinstance(getattr(block, 'mlp', None), DeepMoELayer):
+                for expert in block.mlp.experts:
+                    for layer in expert.layers[1:-1]:
+                        nn.init.eye_(layer.weight)
+                        nn.init.zeros_(layer.bias)
 
     def _init_weights(self, m):
         # this fn left here for compat with downstream users
@@ -1049,3 +1188,81 @@ def vit_base_patch16_224_miil(pretrained=False, **kwargs):
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, qkv_bias=False, **kwargs)
     model = _create_vision_transformer('vit_base_patch16_224_miil', pretrained=pretrained, **model_kwargs)
     return model
+
+
+if __name__ == "__main__":
+    # -----------------------------------------------------------------------
+    # Unit tests: verify forward pass shapes and backward gradient flow for
+    # DeepExpert, DeepMoELayer, and Block with deep experts.
+    # -----------------------------------------------------------------------
+    import sys
+    print("=" * 60)
+    print("Test A: DeepExpert — forward shape + backward gradient")
+    print("=" * 60)
+    model_dim, hidden_size, B = 384, 1536, 4
+    for depth in [2, 3, 4, 5]:
+        expert = DeepExpert(model_dim, hidden_size, depth)
+        x = torch.randn(B, model_dim, requires_grad=True)
+        out = expert(x)
+        loss = out.sum()
+        loss.backward()
+        assert x.grad is not None, f"depth={depth}: no grad on input"
+        assert out.shape == (B, model_dim), f"depth={depth}: bad output shape {out.shape}"
+        num_params = sum(p.numel() for p in expert.parameters())
+        print(f"  depth={depth}: out={tuple(out.shape)}, "
+              f"grad_norm={x.grad.norm():.4f}, params={num_params}  OK")
+
+    print()
+    print("=" * 60)
+    print("Test B: DeepMoELayer — shape, input grad, all experts get grad")
+    print("=" * 60)
+    B, S, D = 2, 20, 384
+    for depth in [3, 4, 5]:
+        for gate_k in [1, 2]:
+            moe = DeepMoELayer(model_dim=D, num_experts=4, hidden_size=512,
+                               gate_k=gate_k, depth=depth)
+            x = torch.randn(B, S, D, requires_grad=True)
+            out = moe(x)
+            assert out.shape == (B, S, D), f"depth={depth} k={gate_k}: bad out shape {out.shape}"
+            loss = out.sum()
+            loss.backward()
+            assert x.grad is not None, f"depth={depth} k={gate_k}: no grad on input"
+            # Verify every expert's first layer received a gradient
+            missing = [ei for ei, exp in enumerate(moe.experts)
+                       if exp.layers[0].weight.grad is None]
+            assert not missing, (
+                f"depth={depth} k={gate_k}: experts {missing} have no grad on layers[0].weight — "
+                "possible dead expert (never selected by top-k with this random seed)"
+            )
+            print(f"  depth={depth} k={gate_k}: out={tuple(out.shape)}, "
+                  f"input_grad_norm={x.grad.norm():.4f}, l_aux={moe.l_aux.item():.4f}  OK")
+
+    print()
+    print("=" * 60)
+    print("Test C: Block integration — MoE layer with expert_depth 2..5")
+    print("=" * 60)
+    B, S, dim = 2, 197, 384   # typical DeiT-small: 196 patches + 1 CLS token
+    depths_to_test = [2, 3, 4, 5] if tutel_moe is not None else [3, 4, 5]
+    if tutel_moe is None:
+        print("  (Tutel not installed — skipping depth=2 Tutel path)")
+    for depth in depths_to_test:
+        use_tutel = (depth == 2)
+        block = Block(
+            dim=dim, num_heads=6, mlp_ratio=4.0,
+            cur_depth=0, moe_layers=["S"],
+            num_experts=4, gate_k=1,
+            prune_ratio=0.0, is_tutel=use_tutel,
+            expert_depth=depth,
+        )
+        x = torch.randn(B, S, dim, requires_grad=True)
+        out = block(x)
+        assert out.shape == (B, S, dim), f"Block depth={depth}: bad out shape {out.shape}"
+        out.sum().backward()
+        assert x.grad is not None, f"Block depth={depth}: no grad on input"
+        aux = block.aux_loss.item() if block.aux_loss is not None else 0.0
+        print(f"  depth={depth}: out={tuple(out.shape)}, "
+              f"input_grad_norm={x.grad.norm():.4f}, aux_loss={aux:.6f}  OK")
+
+    print()
+    print("All tests passed.")
+    sys.exit(0)

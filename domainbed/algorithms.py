@@ -1,5 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
+import os
 import sys
 from itertools import chain
 
@@ -15,8 +16,7 @@ from domainbed.lib.misc import (
 from copy import deepcopy
 import copy
 
-import os as _os
-sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vision_transformer
 from collections import defaultdict, OrderedDict
 
@@ -194,17 +194,28 @@ class GMOE(Algorithm):
 
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(GMOE, self).__init__(input_shape, num_classes, num_domains, hparams)
-        moe_top_k = int(self.hparams.get('moe_top_k', 1))
-        num_experts = int(self.hparams.get('num_experts', 6))
-        self.model = vision_transformer.deit_small_patch16_224(
-            pretrained=True, num_classes=num_classes,
-            moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=4., num_experts=num_experts,
-            is_tutel=False, drop_path_rate=0.1, router='cosine_top',
-            moe_top_k=moe_top_k,
-        ).cuda()
+        num_experts  = hparams.get('num_experts',       6)
+        gate_k       = hparams.get('gate_k',            1)
+        mlp_ratio    = hparams.get('mlp_ratio',         4.0)
+        prune_ratio  = hparams.get('expert_prune_ratio', 0.0)
+        expert_depth = hparams.get('expert_depth',      2)
+        model_name   = hparams.get('model',             'deit_small_patch16_224')
+        model_factory = getattr(vision_transformer, model_name)
+        self.model = model_factory(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=4.0, expert_mlp_ratio=mlp_ratio, num_experts=num_experts, gate_k=gate_k, prune_ratio=prune_ratio, is_tutel=True, drop_path_rate=0.1, router='cosine_top', expert_depth=expert_depth).cuda()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.hparams["lr"], weight_decay=self.hparams['weight_decay'])
         self.ortho_loss_fn = OrthoLoss()
         self.variance_loss_fn = VarianceLoss()
+
+    def _preprocess(self, x):
+        """Resize to 224×224 and expand to 3 channels if needed (e.g. CMNIST 2×28×28)."""
+        if x.shape[1] != 3:
+            ch_mean = x.mean(dim=1, keepdim=True)
+            x = torch.cat([x, ch_mean], dim=1)  # (B,2,H,W) → (B,3,H,W)
+            if x.shape[1] != 3:  # fallback for other channel counts
+                x = x[:, :3, :, :]
+        if x.shape[2] != 224 or x.shape[3] != 224:
+            x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+        return x
 
     def update(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])
@@ -245,6 +256,7 @@ class GMOE(Algorithm):
         }
 
     def predict(self, x, forward_feature=False):
+        x = self._preprocess(x)
         if forward_feature:
             return self.model.forward_features(x)
         else:
@@ -253,6 +265,52 @@ class GMOE(Algorithm):
                 return (prediction[0] + prediction[1]) / 2
             else:
                 return prediction
+
+
+class GMoEOMoE(GMOE):
+    """GMOE + OMoE Gram-Schmidt orthogonalization.
+
+    Always uses the custom PyTorch MoE path (force_custom_moe=True) so that
+    OMoE can be applied for all expert_depth values including depth=2 (bypasses Tutel).
+
+    Two new hparams gate the extra mechanisms:
+      use_omoe         (bool, default False): enable Gram-Schmidt orthogonalization
+      use_balance_loss (bool, default False): enable importance CV² auxiliary loss
+
+    With both False this is a pure-PyTorch GMOE baseline — useful for isolating
+    the effect of each mechanism in ablation comparisons.
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        # Bypass GMOE.__init__ and call Algorithm.__init__ directly so we can
+        # build the model with the extra flags.
+        Algorithm.__init__(self, input_shape, num_classes, num_domains, hparams)
+        num_experts       = hparams.get('num_experts',        6)
+        gate_k            = hparams.get('gate_k',             1)
+        mlp_ratio         = hparams.get('mlp_ratio',          4.0)
+        prune_ratio       = hparams.get('expert_prune_ratio', 0.0)
+        expert_depth      = hparams.get('expert_depth',       2)
+        use_omoe          = hparams.get('use_omoe',           False)
+        use_balance_loss  = hparams.get('use_balance_loss',   False)
+        model_name        = hparams.get('model',              'deit_small_patch16_224')
+        model_factory     = getattr(vision_transformer, model_name)
+        self.model = model_factory(
+            pretrained=True, num_classes=num_classes,
+            moe_layers=['F'] * 8 + ['S', 'F'] * 2,
+            mlp_ratio=4.0, expert_mlp_ratio=mlp_ratio,
+            num_experts=num_experts, gate_k=gate_k,
+            prune_ratio=prune_ratio, is_tutel=True,
+            drop_path_rate=0.1, router='cosine_top',
+            expert_depth=expert_depth,
+            force_custom_moe=True,
+            use_omoe=use_omoe,
+            use_balance_loss=use_balance_loss,
+        ).cuda()
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay'])
+    # update() and predict() inherited from GMOE unchanged
 
 
 class Fish(Algorithm):

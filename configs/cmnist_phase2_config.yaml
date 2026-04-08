@@ -1,0 +1,69 @@
+# ============================================================
+# Phase 2 Finetuning Configuration — GMOE on ColoredMNIST
+# ============================================================
+# All values here are defaults. CLI flags override them at runtime.
+# Run: python -m domainbed.scripts.phase2_finetune --config configs/cmnist_phase2_config.yaml
+
+data:
+  # Root directory containing MNIST data
+  data_dir: "./domainbed/data"
+  dataset: "ColoredMNIST"
+
+phase1:
+  # Phase 1 checkpoint base directory. Script resolves full path as:
+  #   {ckpt_base}/{env_prefix}_env{env}/{ckpt_filename}
+  ckpt_base: "train_output"
+  ckpt_filename: "model.pkl"
+  env_prefix: "cmnist"   # → train_output/cmnist_env{env}/
+
+output:
+  # Phase 2 output base directory. Script resolves as:
+  #   {base_dir}/{env_prefix}_addon_D_env{env}/
+  base_dir: "train_output"
+
+experiment:
+  # Which leave-one-out experiment (0=+90%, 1=+80%, 2=-90%)
+  env: 0
+  seed: 42
+
+embedding:
+  # Batch size for embedding extraction forward pass
+  batch_size: 64
+  # Where to save embeddings. null → auto: {phase1_ckpt_dir}/embeddings/
+  save_dir: null
+
+clustering:
+  # Number of K-Means clusters per class
+  # Ablate across: [5, 7, 10, 13, 15]
+  k: 5
+  # PCA dimensionality before K-Means. Set 0 to skip PCA entirely.
+  pca_dims: 50
+  # Clustering algorithm (currently only "kmeans" supported)
+  algorithm: "kmeans"
+
+sampling:
+  # Number of images to sample per cluster per class
+  # Ablate across: [5, 10, 20, 30, 50]
+  x: 20
+  # Save the sampled D-hat index to JSON for reproducibility
+  save_dhat: true
+
+finetuning:
+  # Learning rate for MOE expert + router parameters
+  lr: 1.0e-4
+  # Total finetuning epochs over D-hat
+  epochs: 30
+  # DataLoader batch size for finetuning
+  batch_size: 32
+  # Use augmented transform for D-hat DataLoader
+  augment: true
+  # Evaluate on held-out test env every N epochs
+  eval_every: 5
+  # Save a separate checkpoint whenever test accuracy improves
+  save_best: true
+
+skip:
+  # Set true to reload embeddings from disk instead of re-running Step 1
+  extract: false
+  # Set true to reload dhat JSON from disk instead of re-running Steps 2-3
+  cluster: false

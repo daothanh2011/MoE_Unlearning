@@ -1,0 +1,4 @@
+dataset:      "VLCS"
+data_dir:     "./domainbed/data/"
+test_envs:    [0, 1, 2, 3]
+domain_names: ["C", "L", "S", "V"]
