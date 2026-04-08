@@ -29,6 +29,7 @@ except:
 from domainbed import networks
 # from domainbed import resnet_variants
 import torchvision.models as models
+from domainbed.losses.moe_specialization_losses import OrthoLoss, VarianceLoss
 
 ALGORITHMS = [
     'ERM',
@@ -202,6 +203,8 @@ class GMOE(Algorithm):
         model_factory = getattr(vision_transformer, model_name)
         self.model = model_factory(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=4.0, expert_mlp_ratio=mlp_ratio, num_experts=num_experts, gate_k=gate_k, prune_ratio=prune_ratio, is_tutel=True, drop_path_rate=0.1, router='cosine_top', expert_depth=expert_depth).cuda()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.hparams["lr"], weight_decay=self.hparams['weight_decay'])
+        self.ortho_loss_fn = OrthoLoss()
+        self.variance_loss_fn = VarianceLoss()
 
     def _preprocess(self, x):
         """Resize to 224×224 and expand to 3 channels if needed (e.g. CMNIST 2×28×28)."""
@@ -217,22 +220,40 @@ class GMOE(Algorithm):
     def update(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
+        device = all_x.device
         loss = F.cross_entropy(self.predict(all_x), all_y)
-        loss_aux_list = []
+
+        loss_aux      = torch.tensor(0., device=device)
+        ortho_loss    = torch.tensor(0., device=device)
+        variance_loss = torch.tensor(0., device=device)
+
         for block in self.model.blocks:
-            if getattr(block, 'aux_loss') is not None:
-                loss_aux_list.append(block.aux_loss)
+            if getattr(block, 'aux_loss', None) is not None:
+                loss_aux = loss_aux + block.aux_loss
 
-        loss_aux = 0
-        for layer_loss in loss_aux_list:
-            loss_aux += layer_loss
+                if (block.expert_outputs is not None
+                        and self.hparams.get('ortho_loss_weight', 0.0) > 0):
+                    ortho_loss = ortho_loss + self.ortho_loss_fn(block.expert_outputs)
 
-        loss += loss_aux
+                if (block.routing_scores is not None
+                        and self.hparams.get('variance_loss_weight', 0.0) > 0):
+                    variance_loss = variance_loss + self.variance_loss_fn(block.routing_scores)
+
+        loss = (loss
+                + loss_aux
+                + self.hparams.get('ortho_loss_weight', 0.0) * ortho_loss
+                + self.hparams.get('variance_loss_weight', 0.0) * variance_loss)
+
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        return {'loss': loss.item(), 'loss_aux': loss_aux.item()}
+        return {
+            'loss':           loss.item(),
+            'loss_aux':       loss_aux.item(),
+            'loss_ortho':     ortho_loss.item(),
+            'loss_variance':  variance_loss.item(),
+        }
 
     def predict(self, x, forward_feature=False):
         x = self._preprocess(x)

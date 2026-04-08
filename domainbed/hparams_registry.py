@@ -211,6 +211,12 @@ def _hparams(algorithm, dataset, random_seed):
             _hparam('resnet_dropout', 0.1, lambda r: r.choice([0., 0.1, 0.5]))
             _hparam('weight_decay', 0, lambda r: 0.)
 
+        # New losses from Advanced MoE (NeurIPS 2025); default 0 preserves baseline
+        _hparam('ortho_loss_weight',    0.0, lambda r: r.choice([0., 1e-4, 1e-3]))
+        _hparam('variance_loss_weight', 0.0, lambda r: r.choice([0., 1e-4, 1e-3]))
+        _hparam('moe_top_k',            1,   lambda r: r.choice([1, 2]))
+        _hparam('num_experts',          6,   lambda r: r.choice([6, 8, 12, 16]))
+
     return hparams
 
 

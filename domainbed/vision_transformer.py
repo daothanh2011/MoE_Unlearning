@@ -49,6 +49,8 @@ if float(torch.version.cuda) > 10.1:
     except ImportError:
         tutel_moe = None
 
+from domainbed.moe_layer import TransparentMoELayer
+
 _logger = logging.getLogger(__name__)
 
 
@@ -372,6 +374,8 @@ class Block(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         self.aux_loss = None
+        self.routing_scores = None
+        self.expert_outputs = None
         self.is_moe_layer = False
         # Dense blocks use mlp_ratio (matches pretrained checkpoint, default 4.0).
         # MoE expert blocks use expert_mlp_ratio when provided, otherwise fall back to mlp_ratio.
@@ -416,6 +420,9 @@ class Block(nn.Module):
             x = x + self.drop_path(self.attn(self.norm1(x)))
             x = x + self.drop_path(self.mlp(self.norm2(x)))
             self.aux_loss = self.mlp.l_aux * self.aux_loss_weights
+            # TransparentMoELayer exposes these; Tutel path leaves them None
+            self.routing_scores = getattr(self.mlp, 'routing_scores', None)
+            self.expert_outputs = getattr(self.mlp, 'expert_outputs', None)
             return x
         elif self.cur_layer == 'F':
             x = x + self.drop_path(self.attn(self.norm1(x)))
