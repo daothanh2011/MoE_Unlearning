@@ -57,18 +57,25 @@ _MODEL_TAG = {
 }
 
 
-def make_run_id(dataset, num_experts, top_k, expert_prune_ratio, mlp_ratio, expert_depth, test_env, model="deit_small_patch16_224"):
-    pr_int   = int(round(expert_prune_ratio * 10))
-    mlp_str  = str(mlp_ratio).replace('.', 'p')   # e.g. 5.2 → "5p2"
-    model_tag = _MODEL_TAG.get(model, model)       # fallback to full name if unknown
-    return f"{dataset}_{model_tag}_N{num_experts}_K{top_k}_PR{pr_int:02d}_MLP{mlp_str}_D{expert_depth}_env{test_env}"
+
+def make_run_id(dataset, num_experts, top_k, expert_prune_ratio, mlp_ratio, expert_depth, test_env,
+                model="deit_small_patch16_224", use_omoe=False, use_balance_loss=False):
+    pr_int    = int(round(expert_prune_ratio * 10))
+    mlp_str   = str(mlp_ratio).replace('.', 'p')   # e.g. 5.2 → "5p2"
+    model_tag = _MODEL_TAG.get(model, model)        # fallback to full name if unknown
+    omoe_tag  = "_OMoE1" if use_omoe else "_OMoE0"
+    bal_tag   = "_BL1"   if use_balance_loss else "_BL0"
+    return (f"{dataset}_{model_tag}_N{num_experts}_K{top_k}_PR{pr_int:02d}"
+            f"_MLP{mlp_str}_D{expert_depth}{omoe_tag}{bal_tag}_env{test_env}")
 
 
-def check_constraint(num_experts, top_k, expert_prune_ratio, mlp_ratio, expert_depth, constraints):
+def check_constraint(num_experts, top_k, expert_prune_ratio, mlp_ratio, expert_depth, constraints,
+                     use_omoe=False, use_balance_loss=False):
     for expr in constraints:
         local = {"top_k": top_k, "num_experts": num_experts,
                  "expert_prune_ratio": expert_prune_ratio,
-                 "mlp_ratio": mlp_ratio, "expert_depth": expert_depth}
+                 "mlp_ratio": mlp_ratio, "expert_depth": expert_depth,
+                 "use_omoe": use_omoe, "use_balance_loss": use_balance_loss}
         try:
             if not eval(expr, {"__builtins__": {}}, local):
                 return False
@@ -99,7 +106,8 @@ def parse_filter(filter_str):
 # ---------------------------------------------------------------------------
 
 def build_command(run_id, dataset_cfg, num_experts, top_k, expert_prune_ratio,
-                  mlp_ratio, expert_depth, test_env, cfg):
+                  mlp_ratio, expert_depth, test_env, cfg,
+                  use_omoe=False, use_balance_loss=False):
     fixed   = cfg["fixed_params"]
     outputs = cfg["output"]
 
@@ -109,6 +117,8 @@ def build_command(run_id, dataset_cfg, num_experts, top_k, expert_prune_ratio,
         "mlp_ratio":          mlp_ratio,
         "expert_prune_ratio": expert_prune_ratio,
         "expert_depth":       expert_depth,
+        "use_omoe":           use_omoe,
+        "use_balance_loss":   use_balance_loss,
         "model":              fixed.get("model", "deit_small_patch16_224"),
     }
 
@@ -216,15 +226,18 @@ def build_runs_for_dataset(dataset_cfg, cfg, filter_kv):
         pr = vals["expert_prune_ratio"]
         mr = vals["mlp_ratio"]
         ed = vals["expert_depth"]
+        uo = vals.get("use_omoe", False)
+        bl = vals.get("use_balance_loss", False)
 
-        if not check_constraint(n, k, pr, mr, ed, constraints):
+        if not check_constraint(n, k, pr, mr, ed, constraints, use_omoe=uo, use_balance_loss=bl):
             continue
 
         # Apply --filter
         skip = False
         for fk, fv in filter_kv.items():
             actual = {"num_experts": n, "top_k": k, "expert_prune_ratio": pr,
-                      "mlp_ratio": mr, "expert_depth": ed}.get(fk)
+                      "mlp_ratio": mr, "expert_depth": ed,
+                      "use_omoe": uo, "use_balance_loss": bl}.get(fk)
             if actual is None:
                 continue
             if isinstance(fv, float):
@@ -237,9 +250,11 @@ def build_runs_for_dataset(dataset_cfg, cfg, filter_kv):
             continue
 
         for env in test_envs:
-            run_id = make_run_id(dataset_name, n, k, pr, mr, ed, env, model)
+            run_id = make_run_id(dataset_name, n, k, pr, mr, ed, env, model,
+                                 use_omoe=uo, use_balance_loss=bl)
             cmd, log_dir, output_dir = build_command(
-                run_id, dataset_cfg, n, k, pr, mr, ed, env, cfg)
+                run_id, dataset_cfg, n, k, pr, mr, ed, env, cfg,
+                use_omoe=uo, use_balance_loss=bl)
             runs.append((run_id, cmd, log_dir))
 
     return runs

@@ -271,6 +271,32 @@ class DeepExpert(nn.Module):
         return self.layers[-1](x)
 
 
+def gram_schmidt(E: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Modified Gram-Schmidt orthogonalization on k expert output vectors per token.
+
+    Args:
+        E: [T, k, D] — T tokens, k active expert outputs, D model dim.
+           Assumes E[:, 0, :] is the highest-weight expert (topk returns descending order),
+           so the most-trusted expert anchors the orthogonal basis.
+    Returns:
+        E_orth [T, k, D]: mutually orthogonal (not unit-normalized) vectors.
+                          The first vector is kept as-is; each subsequent vector has
+                          all projections onto prior basis vectors subtracted out.
+
+    Differentiability: all ops are differentiable; autograd flows through normally.
+    k=1 case: loop body never executes — returns E unchanged (true no-op).
+    """
+    vecs = list(E.unbind(dim=1))   # k tensors of shape [T, D]
+    orth = [vecs[0]]
+    for j in range(1, len(vecs)):
+        v = vecs[j]
+        for u in orth:
+            proj = (v * u).sum(-1, keepdim=True) / (u * u).sum(-1, keepdim=True).clamp(min=eps) * u
+            v = v - proj
+        orth.append(v)
+    return torch.stack(orth, dim=1)   # [T, k, D]
+
+
 class DeepMoELayer(nn.Module):
     """Custom MoE layer with configurable expert depth (depth > 2).
 
@@ -280,45 +306,65 @@ class DeepMoELayer(nn.Module):
     """
 
     def __init__(self, model_dim: int, num_experts: int, hidden_size: int,
-                 gate_k: int, depth: int, dropout: float = 0.1):
+                 gate_k: int, depth: int, dropout: float = 0.1,
+                 use_omoe: bool = False, use_balance_loss: bool = False):
         super().__init__()
-        self.gate_k      = gate_k
-        self.num_experts = num_experts
+        self.gate_k           = gate_k
+        self.num_experts      = num_experts
+        self.use_omoe         = use_omoe
+        self.use_balance_loss = use_balance_loss
         self.experts = nn.ModuleList(
             DeepExpert(model_dim, hidden_size, depth, dropout)
             for _ in range(num_experts)
         )
         # Cosine gate: project normalized input to per-expert logits
         self.gate_proj = nn.Linear(model_dim, num_experts, bias=False)
-        # Mirrors tutel's l_aux attribute; stays 0 (no load-balancing loss)
+        # Mirrors tutel's l_aux attribute; value set during forward
         self.l_aux = torch.tensor(0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, S, D)
         B, S, D = x.shape
-        x_flat = x.reshape(-1, D)                                     # (T, D)  T = B*S
+        x_flat = x.reshape(-1, D)                                          # (T, D)  T = B*S
+        T = x_flat.shape[0]
 
-        # Cosine top-k routing
-        logits    = self.gate_proj(F.normalize(x_flat, dim=-1))       # (T, E)
-        topk_vals, topk_idx = logits.topk(self.gate_k, dim=-1)        # (T, k)
-        gates     = F.softmax(topk_vals, dim=-1)                      # (T, k)
+        # Cosine top-k routing (topk returns descending order: ki=0 = highest-weight expert)
+        logits             = self.gate_proj(F.normalize(x_flat, dim=-1))   # (T, E)
+        topk_vals, topk_idx = logits.topk(self.gate_k, dim=-1)             # (T, k)
+        gates              = F.softmax(topk_vals, dim=-1)                  # (T, k)
 
-        out = torch.zeros_like(x_flat)
+        # Collect raw expert outputs into E_raw[T, k, D]
+        E_raw = torch.zeros(T, self.gate_k, D, device=x.device, dtype=x.dtype)
         for ki in range(self.gate_k):
-            idx = topk_idx[:, ki]                                     # (T,)
-            g   = gates[:, ki].unsqueeze(-1)                          # (T, 1)
+            idx = topk_idx[:, ki]                                          # (T,)
             for ei in range(self.num_experts):
                 mask = (idx == ei)
                 if mask.any():
-                    out[mask] = out[mask] + g[mask] * self.experts[ei](x_flat[mask])
+                    E_raw[mask, ki] = self.experts[ei](x_flat[mask])
 
-        self.l_aux = torch.tensor(0.0, device=x.device)
+        # OMoE: Gram-Schmidt orthogonalization (no-op when gate_k == 1)
+        if self.use_omoe and self.gate_k > 1:
+            E_raw = gram_schmidt(E_raw)                                    # [T, k, D]
+
+        # Weighted aggregation
+        out = (gates.unsqueeze(-1) * E_raw).sum(dim=1)                     # (T, D)
+
+        # Optional load-balance auxiliary loss (importance CV²)
+        if self.use_balance_loss:
+            # route_prob[t, e] = gate weight if token t chose expert e, else 0
+            route_prob = torch.zeros(T, self.num_experts, device=x.device, dtype=gates.dtype)
+            route_prob.scatter_(1, topk_idx, gates)                        # [T, N]
+            imp = route_prob.sum(dim=0)                                    # [N]
+            self.l_aux = imp.var() / (imp.mean() ** 2 + 1e-10)            # CV²
+        else:
+            self.l_aux = torch.tensor(0.0, device=x.device)
+
         return out.reshape(B, S, D)
 
 
 class Block(nn.Module):
 
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, cur_depth=0, moe_layers=None, num_experts=6, gate_k=1, prune_ratio=0.0, router='cosine_top', is_tutel=False, index_hook=False, expert_depth=2, expert_mlp_ratio=None):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, cur_depth=0, moe_layers=None, num_experts=6, gate_k=1, prune_ratio=0.0, router='cosine_top', is_tutel=False, index_hook=False, expert_depth=2, expert_mlp_ratio=None, use_omoe=False, use_balance_loss=False, force_custom_moe=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
@@ -337,7 +383,7 @@ class Block(nn.Module):
         self.is_tutel = is_tutel
         self.aux_loss_weights = 0.01
         if self.cur_layer == 'S':
-            if expert_depth == 2:
+            if expert_depth == 2 and not force_custom_moe:
                 # Standard Tutel 2-layer FFN expert path (unchanged)
                 if tutel_moe is None:
                     raise ImportError("Tutel is required for expert_depth=2 but is not installed.")
@@ -351,11 +397,13 @@ class Block(nn.Module):
                     is_gshard_loss=False,
                 )
             else:
-                # Custom deep expert path (expert_depth >= 3)
+                # Custom PyTorch MoE path: handles depth>=3, and depth==2 when force_custom_moe=True
                 self.mlp = DeepMoELayer(
                     model_dim=dim, num_experts=num_experts,
                     hidden_size=hidden_size, gate_k=gate_k,
                     depth=expert_depth, dropout=0.1,
+                    use_omoe=use_omoe,
+                    use_balance_loss=use_balance_loss,
                 )
         else:
             self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
@@ -390,7 +438,8 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, weight_init='', moe_layers=None, num_experts=6, gate_k=1, prune_ratio=0.0, index_hook=False, router='cosine_top', is_tutel=False, expert_depth=2, expert_mlp_ratio=None):
+                 act_layer=None, weight_init='', moe_layers=None, num_experts=6, gate_k=1, prune_ratio=0.0, index_hook=False, router='cosine_top', is_tutel=False, expert_depth=2, expert_mlp_ratio=None,
+                 use_omoe=False, use_balance_loss=False, force_custom_moe=False):
         """
         Args:
             img_size (int, tuple): input image size
@@ -431,7 +480,8 @@ class VisionTransformer(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
                 attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                cur_depth=i, moe_layers=moe_layers, num_experts=num_experts, gate_k=gate_k, prune_ratio=prune_ratio, index_hook=index_hook, router=router, is_tutel=is_tutel, expert_depth=expert_depth, expert_mlp_ratio=expert_mlp_ratio)
+                cur_depth=i, moe_layers=moe_layers, num_experts=num_experts, gate_k=gate_k, prune_ratio=prune_ratio, index_hook=index_hook, router=router, is_tutel=is_tutel, expert_depth=expert_depth, expert_mlp_ratio=expert_mlp_ratio,
+                use_omoe=use_omoe, use_balance_loss=use_balance_loss, force_custom_moe=force_custom_moe)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 

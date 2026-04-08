@@ -1,19 +1,21 @@
-sweep_name: "gmoe_expert_sweep"
-description: "Sweep over num_experts, top_k (gate_k), and expert_prune_ratio for GMoE ICLR2023 baseline"
+sweep_name: "gmoe_omoe_sweep"
+description: "Sweep over GMoEOMoE: OMoE Gram-Schmidt orthogonalization + optional load-balance loss"
 
 # --- Parameter Grid ---
 param_grid:
   num_experts:        [6, 32]
-  top_k:              [1, 2]
+  top_k:              [2, 3]
   # expert_prune_ratio: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
   expert_prune_ratio: [0.0]
-  mlp_ratio:          [4, 6, 8, 10, 12]   # width sweep (hidden_dim = embed_dim * mlp_ratio)
-  expert_depth:       [2, 3, 4]                        # depth sweep (number of linear layers per expert)
+  mlp_ratio:          [4, 8, 12]   # width sweep (hidden_dim = embed_dim * mlp_ratio)
+  expert_depth:       [2, 3, 4]           # depth sweep (number of linear layers per expert)
+  use_omoe:           [true]       # OMoE Gram-Schmidt orthogonalization
+  use_balance_loss:   [true]       # importance CV² auxiliary load-balance loss
 
 # --- Fixed Hyperparams (do not sweep these) ---
 # dataset/data_dir/test_envs are specified per-dataset in sweep/configs/{Dataset}.yaml
 fixed_params:
-  algorithm:       "GMOE"
+  algorithm:       "GMoEOMoE"
   steps:           5000
   checkpoint_freq: 500
   seed:            0
@@ -21,7 +23,7 @@ fixed_params:
   #   deit_tiny_patch16_224   (embed_dim=192, num_heads=3,  depth=12, ~5M params)
   #   deit_small_patch16_224  (embed_dim=384, num_heads=6,  depth=12, ~22M params)  ← default
   #   deit_base_patch16_224   (embed_dim=768, num_heads=12, depth=12, ~86M params)
-  model:           "deit_tiny_patch16_224"
+  model:           "deit_small_patch16_224"
 
 # --- Constraints: skip invalid combinations ---
 # top_k must be strictly less than num_experts (K == N means no routing)
@@ -31,7 +33,7 @@ constraints:
 # --- Baseline config (reference point in all plots) ---
 baseline:
   num_experts:        6
-  top_k:              2
+  top_k:              1
   expert_prune_ratio: 0.0
 
 # --- Output paths ---

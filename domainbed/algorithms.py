@@ -246,6 +246,52 @@ class GMOE(Algorithm):
                 return prediction
 
 
+class GMoEOMoE(GMOE):
+    """GMOE + OMoE Gram-Schmidt orthogonalization.
+
+    Always uses the custom PyTorch MoE path (force_custom_moe=True) so that
+    OMoE can be applied for all expert_depth values including depth=2 (bypasses Tutel).
+
+    Two new hparams gate the extra mechanisms:
+      use_omoe         (bool, default False): enable Gram-Schmidt orthogonalization
+      use_balance_loss (bool, default False): enable importance CV² auxiliary loss
+
+    With both False this is a pure-PyTorch GMOE baseline — useful for isolating
+    the effect of each mechanism in ablation comparisons.
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        # Bypass GMOE.__init__ and call Algorithm.__init__ directly so we can
+        # build the model with the extra flags.
+        Algorithm.__init__(self, input_shape, num_classes, num_domains, hparams)
+        num_experts       = hparams.get('num_experts',        6)
+        gate_k            = hparams.get('gate_k',             1)
+        mlp_ratio         = hparams.get('mlp_ratio',          4.0)
+        prune_ratio       = hparams.get('expert_prune_ratio', 0.0)
+        expert_depth      = hparams.get('expert_depth',       2)
+        use_omoe          = hparams.get('use_omoe',           False)
+        use_balance_loss  = hparams.get('use_balance_loss',   False)
+        model_name        = hparams.get('model',              'deit_small_patch16_224')
+        model_factory     = getattr(vision_transformer, model_name)
+        self.model = model_factory(
+            pretrained=True, num_classes=num_classes,
+            moe_layers=['F'] * 8 + ['S', 'F'] * 2,
+            mlp_ratio=4.0, expert_mlp_ratio=mlp_ratio,
+            num_experts=num_experts, gate_k=gate_k,
+            prune_ratio=prune_ratio, is_tutel=True,
+            drop_path_rate=0.1, router='cosine_top',
+            expert_depth=expert_depth,
+            force_custom_moe=True,
+            use_omoe=use_omoe,
+            use_balance_loss=use_balance_loss,
+        ).cuda()
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay'])
+    # update() and predict() inherited from GMOE unchanged
+
+
 class Fish(Algorithm):
     """
     Implementation of Fish, as seen in Gradient Matching for Domain
