@@ -151,6 +151,30 @@ def download_pacs(data_dir):
     os.rename(src_kfold, full_path)
 
 
+def download_pacs_from_hf(full_path):
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise RuntimeError(
+            "Hugging Face fallback requires the `datasets` package.\n"
+            "Install it with: pip install datasets"
+        ) from e
+
+    dataset = load_dataset("flwrlabs/pacs", split="train")
+    label_names = dataset.features["label"].names
+
+    os.makedirs(full_path, exist_ok=True)
+    for i, sample in enumerate(dataset):
+        domain = sample["domain"]
+        class_name = label_names[sample["label"]]
+        image = sample["image"]
+
+        out_dir = os.path.join(full_path, domain, class_name)
+        os.makedirs(out_dir, exist_ok=True)
+        out_file = os.path.join(out_dir, f"{i:06d}.jpg")
+        image.convert("RGB").save(out_file, format="JPEG", quality=95)
+        
+
 # Office-Home #################################################################
 
 def download_office_home(data_dir):
