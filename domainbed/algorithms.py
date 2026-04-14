@@ -60,7 +60,8 @@ ALGORITHMS = [
     'IB_IRM',
     'CAD',
     'CondCAD',
-    'GMOE',
+    'GMoEOMoE',
+    'GMOE_OMOE',
     'GMOE_InvA',
     'GMOE_InvB',
     'GMOE_Full'
@@ -755,7 +756,7 @@ class GMOE_InvA(GMoEVariantBase):
 
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super().__init__(input_shape, num_classes, num_domains, hparams)
-        self.lambda_inv = hparams.get('lambda_inv', 0.1)
+        self.lambda_inv = hparams.get('lambda_inv', 0.0)
 
     def update(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])

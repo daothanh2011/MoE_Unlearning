@@ -74,15 +74,39 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
     sys.stdout = misc.Tee(os.path.join(args.output_dir, 'out.txt'))
     sys.stderr = misc.Tee(os.path.join(args.output_dir, 'err.txt'))
-    if "Debug" not in args.dataset:
+    if 'Debug' not in args.dataset:
         wandb.login(key="b1d6eed8871c7668a889ae74a621b5dbd2f3b070")
-        wandb.init(project="sparse-moe",
-                   entity="letuanhf-hanoi-university-of-science-and-technology",
-                   config={'dataset': args.dataset,
-                           'algorithm': args.algorithm,
-                           'test_envs': args.test_envs},
-                   settings=wandb.Settings(start_method="fork"))
-    wandb.init(settings=wandb.Settings(start_method='thread'))
+
+        _NEVER_SHOW = {
+            'data_augmentation', 'resnet18', 'resnet_dropout',
+            'nonlinear_classifier', 'class_balanced',
+            'val_augment', 'freeze_bn', 'pretrained', 'optimizer',
+        }
+        relevant_keys = {k for k in hparams if k not in _NEVER_SHOW}
+
+        test_env_names = [dataset.ENVIRONMENTS[i] for i in args.test_envs]
+        test_env_str = '+'.join(test_env_names)
+        hparam_str = '_'.join(f'{k}={hparams[k]}' for k in sorted(relevant_keys))
+        run_name = f'{args.algorithm}_{args.dataset}_test[{test_env_str}]_{hparam_str}'
+        if len(run_name) > 128:
+            run_name = run_name[:125] + '...'
+
+        wandb.init(
+            project='sparse-moe',
+            entity='letuanhf-hanoi-university-of-science-and-technology',
+            name=run_name,
+            config={
+                'dataset': args.dataset,
+                'algorithm': args.algorithm,
+                'test_envs': args.test_envs,
+                'test_env_names': test_env_names,
+                'seed': args.seed,
+                'trial_seed': args.trial_seed,
+                'hparams_seed': args.hparams_seed,
+                **{f'hp/{k}': hparams[k] for k in sorted(relevant_keys)},
+            },
+            settings=wandb.Settings(start_method='thread'),
+        )
     print("Environment:")
     print("\tPython: {}".format(sys.version.split(" ")[0]))
     print("\tPyTorch: {}".format(torch.__version__))
