@@ -30,6 +30,8 @@ from domainbed import networks
 # from domainbed import resnet_variants
 import torchvision.models as models
 from domainbed.losses.moe_specialization_losses import OrthoLoss, VarianceLoss
+from domainbed.deit_transformer import *
+
 
 ALGORITHMS = [
     'ERM',
@@ -58,7 +60,10 @@ ALGORITHMS = [
     'IB_IRM',
     'CAD',
     'CondCAD',
-    'GMOE'
+    'GMOE',
+    'GMOE_InvA',
+    'GMOE_InvB',
+    'GMOE_Full'
 ]
 
 
@@ -667,3 +672,231 @@ class Fishr(Algorithm):
 
     def predict(self, x):
         return self.network(x)
+
+
+# ---------------------------------------------------------------------------
+# Base class shared by all variants
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Base class
+# ---------------------------------------------------------------------------
+
+class GMoEVariantBase(nn.Module):
+    """
+    Shared backbone + MoE head used by all variants.
+
+    Architecture (from the paper):
+        z      = DeiTFeaturizer(x)          CLS token, 384-dim
+        h_m    = Expert_m(z)               M small expert MLPs → r-dim each
+        pi(x)  = softmax(Router(z))        soft routing weights (B, M)
+        h(x)   = sum_m pi_m * h_m          weighted aggregation
+        y_hat  = Classifier(h(x))
+
+    Subclasses implement update() with their specific loss combination.
+    """
+    NUM_EXPERTS = 6
+    EXPERT_DIM = 256  # r in the paper
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super().__init__()
+        self.hparams = hparams
+        self.num_classes = num_classes
+        self.num_domains = num_domains
+
+        self.featurizer = DeiTFeaturizer(pretrained=True).cuda()
+        self.moe_head = ExplicitMoEHead(
+            in_dim=self.featurizer.n_outputs,
+            expert_dim=self.EXPERT_DIM,
+            num_experts=self.NUM_EXPERTS,
+            num_classes=num_classes,
+        ).cuda()
+
+        self.optimizer = torch.optim.Adam(
+            list(self.featurizer.parameters()) + list(self.moe_head.parameters()),
+            lr=hparams['lr'],
+            weight_decay=hparams['weight_decay'],
+        )
+
+    def _forward(self, x):
+        """Returns (logits, pi, h_stack)."""
+        z = self.featurizer(x)
+        return self.moe_head(z)
+
+    def predict(self, x):
+        logits, _, _ = self._forward(x)
+        return logits
+
+    def _get_domain_ids(self, minibatches):
+        """Build a (B,) domain-index tensor aligned with the concatenated batch."""
+        ids = [
+            torch.full((x.size(0),), d, dtype=torch.long)
+            for d, (x, _) in enumerate(minibatches)
+        ]
+        return torch.cat(ids).to(minibatches[0][0].device)
+
+    def update(self, minibatches, unlabeled=None):
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# Variant A: expert-wise mean alignment (first-order invariance)
+# ---------------------------------------------------------------------------
+
+class GMOE_InvA(GMoEVariantBase):
+    """
+    L = L_cls + lambda_inv * L_inv^A
+
+    L_inv^A = sum_m sum_c sum_{d != d'} || mu_{m,d,c} - mu_{m,d',c} ||^2
+
+    Hparams:
+        lambda_inv (float, default 0.1): weight on the invariance loss
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super().__init__(input_shape, num_classes, num_domains, hparams)
+        self.lambda_inv = hparams.get('lambda_inv', 0.1)
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        dom_id = self._get_domain_ids(minibatches)
+
+        logits, pi, h_stack = self._forward(all_x)
+
+        l_cls = F.cross_entropy(logits, all_y)
+        l_inv = loss_inv_A(h_stack, pi, all_y, self.num_classes,
+                           dom_id, self.num_domains)
+        loss = l_cls + self.lambda_inv * l_inv
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {
+            'loss': loss.item(),
+            'loss_cls': l_cls.item(),
+            'loss_inv': l_inv.item(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Variant B: expert-wise mean + covariance alignment (second-order invariance)
+# ---------------------------------------------------------------------------
+
+class GMOE_InvB(GMoEVariantBase):
+    """
+    L = L_cls + lambda_inv * L_inv^B
+
+    L_inv^B = sum_{m,c} sum_{d != d'} (
+        || mu_{m,d,c} - mu_{m,d',c} ||^2
+      + alpha * || Sigma_{m,d,c} - Sigma_{m,d',c} ||_F^2
+    )
+
+    Hparams:
+        lambda_inv (float, default 0.1): weight on the invariance loss
+        alpha_cov  (float, default 0.1): weight on the covariance term inside L_inv^B
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super().__init__(input_shape, num_classes, num_domains, hparams)
+        self.lambda_inv = hparams.get('lambda_inv', 0.1)
+        self.alpha_cov = hparams.get('alpha_cov', 0.1)
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        dom_id = self._get_domain_ids(minibatches)
+
+        logits, pi, h_stack = self._forward(all_x)
+
+        l_cls = F.cross_entropy(logits, all_y)
+        l_inv = loss_inv_B(h_stack, pi, all_y, self.num_classes,
+                           dom_id, self.num_domains, alpha=self.alpha_cov)
+        loss = l_cls + self.lambda_inv * l_inv
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {
+            'loss': loss.item(),
+            'loss_cls': l_cls.item(),
+            'loss_inv': l_inv.item(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Variant Full: all six loss terms
+# ---------------------------------------------------------------------------
+
+class GMOE_Full(GMoEVariantBase):
+    """
+    L = L_cls
+      + lambda_inv  * L_inv   (A or B depending on use_inv_b)
+      + lambda_sp   * L_sp    (sparsity / routing entropy)
+      + lambda_bal  * L_bal   (load balancing)
+      + lambda_div  * L_div   (expert diversity)
+      + lambda_cind * L_cind  (conditional independence)
+
+    Hparams:
+        lambda_inv  (float, default 0.1)
+        lambda_sp   (float, default 0.01)
+        lambda_bal  (float, default 0.01)
+        lambda_div  (float, default 0.01)
+        lambda_cind (float, default 0.01)
+        alpha_cov   (float, default 0.1)   covariance weight inside L_inv^B
+        use_inv_b   (bool,  default False)  use Option B invariance instead of A
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super().__init__(input_shape, num_classes, num_domains, hparams)
+        self.lambda_inv = hparams.get('lambda_inv', 0.1)
+        self.lambda_sp = hparams.get('lambda_sp', 0.01)
+        self.lambda_bal = hparams.get('lambda_bal', 0.01)
+        self.lambda_div = hparams.get('lambda_div', 0.01)
+        self.lambda_cind = hparams.get('lambda_cind', 0.01)
+        self.alpha_cov = hparams.get('alpha_cov', 0.1)
+        self.use_inv_b = hparams.get('use_inv_b', False)
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        dom_id = self._get_domain_ids(minibatches)
+
+        logits, pi, h_stack = self._forward(all_x)
+
+        l_cls = F.cross_entropy(logits, all_y)
+
+        if self.use_inv_b:
+            l_inv = loss_inv_B(h_stack, pi, all_y, self.num_classes,
+                               dom_id, self.num_domains, alpha=self.alpha_cov)
+        else:
+            l_inv = loss_inv_A(h_stack, pi, all_y, self.num_classes,
+                               dom_id, self.num_domains)
+
+        l_sp = loss_sparse(pi)
+        l_bal = loss_balance(pi)
+        l_div = loss_diversity(h_stack)
+        l_cind = loss_cond_independence(h_stack, all_y, self.num_classes)
+
+        loss = (l_cls
+                + self.lambda_inv * l_inv
+                + self.lambda_sp * l_sp
+                + self.lambda_bal * l_bal
+                + self.lambda_div * l_div
+                + self.lambda_cind * l_cind)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {
+            'loss': loss.item(),
+            'loss_cls': l_cls.item(),
+            'loss_inv': l_inv.item(),
+            'loss_sp': l_sp.item(),
+            'loss_bal': l_bal.item(),
+            'loss_div': l_div.item(),
+            'loss_cind': l_cind.item(),
+        }
