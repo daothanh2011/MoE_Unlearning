@@ -108,6 +108,24 @@ if __name__ == "__main__":
     # for k, v in sorted(hparams.items()):
     #     print('\t{}: {}'.format(k, v))
 
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    if torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+
+    if args.dataset in vars(datasets):
+        dataset = vars(datasets)[args.dataset](args.data_dir,
+                                               args.test_envs, hparams)
+    else:
+        raise NotImplementedError
+
+
     if 'Debug' not in args.dataset:
         wandb.login(key="b1d6eed8871c7668a889ae74a621b5dbd2f3b070")
 
@@ -142,22 +160,6 @@ if __name__ == "__main__":
             settings=wandb.Settings(start_method='thread'),
         )
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-    if torch.cuda.is_available():
-        device = "cuda"
-    else:
-        device = "cpu"
-
-    if args.dataset in vars(datasets):
-        dataset = vars(datasets)[args.dataset](args.data_dir,
-                                               args.test_envs, hparams)
-    else:
-        raise NotImplementedError
 
     # Split each env into an 'in-split' and an 'out-split'. We'll train on
     # each in-split except the test envs, and evaluate on all splits.
