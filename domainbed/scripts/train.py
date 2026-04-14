@@ -77,17 +77,9 @@ if __name__ == "__main__":
     if 'Debug' not in args.dataset:
         wandb.login(key="b1d6eed8871c7668a889ae74a621b5dbd2f3b070")
 
-        _NEVER_SHOW = {
-            'data_augmentation', 'resnet18', 'resnet_dropout',
-            'nonlinear_classifier', 'class_balanced',
-            'val_augment', 'freeze_bn', 'pretrained', 'optimizer',
-        }
-        relevant_keys = {k for k in hparams if k not in _NEVER_SHOW}
-
         test_env_names = [dataset.ENVIRONMENTS[i] for i in args.test_envs]
         test_env_str = '+'.join(test_env_names)
-        hparam_str = '_'.join(f'{k}={hparams[k]}' for k in sorted(relevant_keys))
-        run_name = f'{args.algorithm}_{args.dataset}_test[{test_env_str}]_{hparam_str}'
+        run_name = f'{args.algorithm}_{args.dataset}_test[{test_env_str}]'
         if len(run_name) > 128:
             run_name = run_name[:125] + '...'
 
@@ -101,9 +93,7 @@ if __name__ == "__main__":
                 'test_envs': args.test_envs,
                 'test_env_names': test_env_names,
                 'seed': args.seed,
-                'trial_seed': args.trial_seed,
-                'hparams_seed': args.hparams_seed,
-                **{f'hp/{k}': hparams[k] for k in sorted(relevant_keys)},
+                'trial_seed': args.trial_seed
             },
             settings=wandb.Settings(start_method='thread'),
         )
