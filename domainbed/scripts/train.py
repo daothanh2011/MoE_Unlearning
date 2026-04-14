@@ -74,26 +74,27 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
     sys.stdout = misc.Tee(os.path.join(args.output_dir, 'out.txt'))
     sys.stderr = misc.Tee(os.path.join(args.output_dir, 'err.txt'))
-    # if "Debug" not in args.dataset:
-    #     wandb.init(project="sparse-moe",
-    #                entity='drluodian',
-    #                config={'dataset': args.dataset,
-    #                        'algorithm': args.algorithm,
-    #                        'test_envs': args.test_envs},
-    #                settings=wandb.Settings(start_method="fork"))
-    # wandb.init(settings=wandb.Settings(start_method='thread'))
-    # print("Environment:")
-    # print("\tPython: {}".format(sys.version.split(" ")[0]))
-    # print("\tPyTorch: {}".format(torch.__version__))
-    # print("\tTorchvision: {}".format(torchvision.__version__))
-    # print("\tCUDA: {}".format(torch.version.cuda))
-    # print("\tCUDNN: {}".format(torch.backends.cudnn.version()))
-    # print("\tNumPy: {}".format(np.__version__))
-    # print("\tPIL: {}".format(PIL.__version__))
-    #
-    # print('Args:')
-    # for k, v in sorted(vars(args).items()):
-    #     print('\t{}: {}'.format(k, v))
+    if "Debug" not in args.dataset:
+        wandb.login(key="b1d6eed8871c7668a889ae74a621b5dbd2f3b070")
+        wandb.init(project="sparse-moe",
+                   entity="letuanhf-hanoi-university-of-science-and-technology",
+                   config={'dataset': args.dataset,
+                           'algorithm': args.algorithm,
+                           'test_envs': args.test_envs},
+                   settings=wandb.Settings(start_method="fork"))
+    wandb.init(settings=wandb.Settings(start_method='thread'))
+    print("Environment:")
+    print("\tPython: {}".format(sys.version.split(" ")[0]))
+    print("\tPyTorch: {}".format(torch.__version__))
+    print("\tTorchvision: {}".format(torchvision.__version__))
+    print("\tCUDA: {}".format(torch.version.cuda))
+    print("\tCUDNN: {}".format(torch.backends.cudnn.version()))
+    print("\tNumPy: {}".format(np.__version__))
+    print("\tPIL: {}".format(PIL.__version__))
+
+    print('Args:')
+    for k, v in sorted(vars(args).items()):
+        print('\t{}: {}'.format(k, v))
 
     if args.hparams_seed == 0:
         hparams = hparams_registry.default_hparams(args.algorithm, args.dataset)
@@ -286,8 +287,8 @@ if __name__ == "__main__":
             misc.print_row([results[key] for key in results_keys],
                            colwidth=12)
 
-            # if wandb.run:
-            #     wandb.log(results)
+            if wandb.run:
+                wandb.log(results)
             results.update({
                 'hparams': hparams,
                 'args': vars(args)
