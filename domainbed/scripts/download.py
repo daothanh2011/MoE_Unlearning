@@ -114,13 +114,41 @@ def download_mnist(data_dir):
 
 def download_pacs(data_dir):
     # Original URL: http://www.eecs.qmul.ac.uk/~dl307/project_iccv2017
-    full_path = stage_path(data_dir, "PACS")
+    os.makedirs(data_dir, exist_ok=True)
+    full_path = os.path.join(data_dir, "PACS")
 
-    download_and_extract("https://drive.google.com/uc?id=1JFr8f805nMUelQWWmfnJR3y4_SYoN5Pd",
-                         os.path.join(data_dir, "PACS.zip"))
+    if os.path.isdir(full_path) and any(os.scandir(full_path)):
+        print(f"PACS already exists at {full_path}, skipping download.")
+        return
 
-    os.rename(os.path.join(data_dir, "kfold"),
-              full_path)
+    pacs_zip = os.path.join(data_dir, "PACS.zip")
+    if os.path.exists(pacs_zip):
+        print(f"Using existing archive: {pacs_zip}")
+        zf = ZipFile(pacs_zip, "r")
+        zf.extractall(os.path.dirname(pacs_zip))
+        zf.close()
+        os.remove(pacs_zip)
+    else:
+        try:
+            download_and_extract("https://drive.google.com/uc?id=1JFr8f805nMUelQWWmfnJR3y4_SYoN5Pd",
+                                 pacs_zip)
+        except Exception as e:
+            print(f"Primary PACS source failed: {e}")
+            print("Falling back to Hugging Face dataset mirror: flwrlabs/pacs")
+            download_pacs_from_hf(full_path)
+            return
+
+    src_kfold = os.path.join(data_dir, "kfold")
+    if not os.path.exists(src_kfold):
+        raise RuntimeError(
+            f"Expected extracted folder not found: {src_kfold}. "
+            "The downloaded file may be incomplete or from a different PACS source."
+        )
+
+    if os.path.isdir(full_path) and not any(os.scandir(full_path)):
+        os.rmdir(full_path)
+
+    os.rename(src_kfold, full_path)
 
 
 # Office-Home #################################################################
