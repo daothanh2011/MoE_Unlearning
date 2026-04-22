@@ -30,6 +30,7 @@ from domainbed import networks
 # from domainbed import resnet_variants
 import torchvision.models as models
 from domainbed.losses.moe_specialization_losses import OrthoLoss, VarianceLoss
+from domainbed.losses.gmoe_utils import *
 from domainbed.deit_transformer import *
 
 
@@ -64,7 +65,11 @@ ALGORITHMS = [
     'GMOE_OMOE',
     'GMOE_InvA',
     'GMOE_InvB',
-    'GMOE_Full'
+    'GMOE_Full',
+    'GMOE_InvMMD',
+    'GMOE_InvOT',
+    'GMOE_InvAdv',
+    'GMOE_InvED'
 ]
 
 
@@ -901,3 +906,206 @@ class GMOE_Full(GMoEVariantBase):
             'loss_div': l_div.item(),
             'loss_cind': l_cind.item(),
         }
+
+
+# ===========================================================================
+# Subset-aware invariance variants
+# ===========================================================================
+#
+# All four variants replace the first-order mean alignment (Option A) of
+# GMOE_InvA with a stronger distributional-matching loss.  They share the
+# same skeleton — classification + invariance — and differ only in the
+# invariance objective.
+
+# from domainbed.gmoe_utils import (
+#     loss_inv_MMD,
+#     loss_inv_OT,
+#     loss_inv_Adv,
+#     loss_inv_ED,
+#     ConditionalDomainDiscriminators,
+# )
+
+
+# ---------------------------------------------------------------------------
+# GMOE_InvMMD — conditional MMD
+# ---------------------------------------------------------------------------
+
+class GMOE_InvMMD(GMoEVariantBase):
+    """
+    L = L_cls + lambda_inv * L_inv^MMD
+
+    Hparams:
+        lambda_inv (float, default 0.1)
+        alpha      (float, default 4.0)   routing-weight temperature
+        mmd_sigmas (tuple,  default (1,2,4,8,16))
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super().__init__(input_shape, num_classes, num_domains, hparams)
+        self.lambda_inv = hparams.get('lambda_inv', 0.1)
+        self.alpha = hparams.get('alpha', 4.0)
+        self.sigmas = tuple(hparams.get('mmd_sigmas', (1., 2., 4., 8., 16.)))
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        dom_id = self._get_domain_ids(minibatches)
+
+        logits, pi, h_stack = self._forward(all_x)
+
+        l_cls = F.cross_entropy(logits, all_y)
+        l_inv = loss_inv_MMD(h_stack, pi, all_y, self.num_classes,
+                             dom_id, self.num_domains,
+                             alpha=self.alpha, sigmas=self.sigmas)
+        loss = l_cls + self.lambda_inv * l_inv
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item(), 'loss_cls': l_cls.item(), 'loss_inv': l_inv.item()}
+
+
+# ---------------------------------------------------------------------------
+# GMOE_InvOT — entropic optimal transport
+# ---------------------------------------------------------------------------
+
+class GMOE_InvOT(GMoEVariantBase):
+    """
+    L = L_cls + lambda_inv * L_inv^OT
+
+    Hparams:
+        lambda_inv     (float, default 0.1)
+        alpha          (float, default 4.0)
+        ot_epsilon     (float, default 0.1)   Sinkhorn entropy reg
+        sinkhorn_iters (int,   default 50)
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super().__init__(input_shape, num_classes, num_domains, hparams)
+        self.lambda_inv = hparams.get('lambda_inv', 0.1)
+        self.alpha = hparams.get('alpha', 4.0)
+        self.epsilon = hparams.get('ot_epsilon', 0.1)
+        self.sinkhorn_iters = hparams.get('sinkhorn_iters', 50)
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        dom_id = self._get_domain_ids(minibatches)
+
+        logits, pi, h_stack = self._forward(all_x)
+
+        l_cls = F.cross_entropy(logits, all_y)
+        l_inv = loss_inv_OT(h_stack, pi, all_y, self.num_classes,
+                            dom_id, self.num_domains,
+                            alpha=self.alpha,
+                            epsilon=self.epsilon,
+                            sinkhorn_iters=self.sinkhorn_iters)
+        loss = l_cls + self.lambda_inv * l_inv
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item(), 'loss_cls': l_cls.item(), 'loss_inv': l_inv.item()}
+
+
+# ---------------------------------------------------------------------------
+# GMOE_InvAdv — conditional adversarial alignment
+# ---------------------------------------------------------------------------
+
+class GMOE_InvAdv(GMoEVariantBase):
+    """
+    L = L_cls + lambda_inv * L_inv^Adv
+
+    The discriminators are trained jointly with the rest of the network via
+    a gradient-reversal layer, so a single optimiser step updates both.
+
+    Hparams:
+        lambda_inv (float, default 0.1)
+        alpha      (float, default 4.0)
+        grl_lambda (float, default 1.0)   gradient-reversal scale
+        disc_hidden(int,   default 128)
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super().__init__(input_shape, num_classes, num_domains, hparams)
+        self.lambda_inv = hparams.get('lambda_inv', 0.1)
+        self.alpha = hparams.get('alpha', 4.0)
+        self.grl_lambda = hparams.get('grl_lambda', 1.0)
+
+        self.discriminators = ConditionalDomainDiscriminators(
+            num_experts=self.NUM_EXPERTS,
+            num_classes=num_classes,
+            feat_dim=self.EXPERT_DIM,
+            num_domains=num_domains,
+            hidden=hparams.get('disc_hidden', 128),
+        ).cuda()
+
+        # Re-create the optimiser to include discriminator params
+        self.optimizer = torch.optim.Adam(
+            list(self.featurizer.parameters())
+            + list(self.moe_head.parameters())
+            + list(self.discriminators.parameters()),
+            lr=hparams['lr'],
+            weight_decay=hparams['weight_decay'],
+        )
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        dom_id = self._get_domain_ids(minibatches)
+
+        logits, pi, h_stack = self._forward(all_x)
+
+        l_cls = F.cross_entropy(logits, all_y)
+        l_inv = loss_inv_Adv(h_stack, pi, all_y, self.num_classes,
+                             dom_id, self.num_domains,
+                             self.discriminators,
+                             alpha=self.alpha,
+                             grl_lambda=self.grl_lambda)
+        loss = l_cls + self.lambda_inv * l_inv
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item(), 'loss_cls': l_cls.item(), 'loss_inv': l_inv.item()}
+
+
+# ---------------------------------------------------------------------------
+# GMOE_InvED — energy distance
+# ---------------------------------------------------------------------------
+
+class GMOE_InvED(GMoEVariantBase):
+    """
+    L = L_cls + lambda_inv * L_inv^ED
+
+    Hparams:
+        lambda_inv (float, default 0.1)
+        alpha      (float, default 4.0)
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super().__init__(input_shape, num_classes, num_domains, hparams)
+        self.lambda_inv = hparams.get('lambda_inv', 0.1)
+        self.alpha = hparams.get('alpha', 4.0)
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        dom_id = self._get_domain_ids(minibatches)
+
+        logits, pi, h_stack = self._forward(all_x)
+
+        l_cls = F.cross_entropy(logits, all_y)
+        l_inv = loss_inv_ED(h_stack, pi, all_y, self.num_classes,
+                            dom_id, self.num_domains,
+                            alpha=self.alpha)
+        loss = l_cls + self.lambda_inv * l_inv
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item(), 'loss_cls': l_cls.item(), 'loss_inv': l_inv.item()}

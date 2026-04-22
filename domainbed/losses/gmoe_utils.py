@@ -12,54 +12,6 @@ from domainbed import vision_transformer as vit_module
 
 
 # ---------------------------------------------------------------------------
-# Backbone
-# ---------------------------------------------------------------------------
-
-class DeiTFeaturizer(nn.Module):
-    """
-    Wraps the repo's VisionTransformer (DeiT-small config) to expose the
-    CLS-token feature vector.  All layers are dense ('F') — no MoE, no Tutel.
-    Instantiates VisionTransformer directly, bypassing timm's model registry
-    so there is no conflict with the repo's @register_model decorators.
-    embed_dim = 384 for deit_small.
-    """
-    def __init__(self, pretrained=True):
-        super().__init__()
-        self.vit = vit_module.VisionTransformer(
-            img_size=224, patch_size=16, in_chans=3,
-            num_classes=0,           # no head — returns raw features
-            embed_dim=384, depth=12, num_heads=6,
-            mlp_ratio=4., qkv_bias=True,
-            distilled=True,          # DeiT-small checkpoint has distillation token
-            drop_path_rate=0.1,
-            moe_layers=['F'] * 12,   # all-dense, no Tutel
-            num_experts=1,
-            router='cosine_top',
-        )
-        self.n_outputs = 384
-
-        if pretrained:
-            checkpoint = torch.hub.load_state_dict_from_url(
-                'https://dl.fbaipublicfiles.com/deit/deit_small_distilled_patch16_224-649709d9.pth',
-                map_location='cpu', check_hash=True,
-            )
-            state = checkpoint.get('model', checkpoint)
-            # Drop classifier head keys — not present when num_classes=0
-            state = {k: v for k, v in state.items()
-                     if not k.startswith('head')}
-            missing, _ = self.vit.load_state_dict(state, strict=False)
-            if missing:
-                print(f'[DeiTFeaturizer] missing keys (expected if head removed): {missing}')
-
-    def forward(self, x):
-        # forward_features returns (cls, dist) tuple for distilled DeiT
-        out = self.vit.forward_features(x)
-        if isinstance(out, tuple):
-            return out[0]   # CLS token → (B, 384)
-        return out
-
-
-# ---------------------------------------------------------------------------
 # Explicit MoE head
 # ---------------------------------------------------------------------------
 
