@@ -69,6 +69,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from domainbed import vision_transformer as vit_module
 
