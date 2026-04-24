@@ -180,8 +180,12 @@ class ExplicitMoEHead(nn.Module):
     Returns per-expert outputs h_m and routing weights pi so that the
     variant-specific loss functions can operate on them.
     """
-    def __init__(self, in_dim, expert_dim, num_experts, num_classes):
+    def __init__(self, in_dim, expert_dim, num_experts, num_classes,
+                 mlp_ratio=None, prune_ratio=0.0, expert_depth=2):
         super().__init__()
+        if expert_depth < 2:
+            raise ValueError('expert_depth must be >= 2')
+        
         self.num_experts = num_experts
         self.expert_dim  = expert_dim
         self.expert_depth = expert_depth
