@@ -724,6 +724,46 @@ class GMoEVariantBase(nn.Module):
             weight_decay=hparams['weight_decay'],
         )
 
+        self._print_param_counts()
+
+    def _count_params(self, module):
+        """Return (total, trainable) parameter counts for a module."""
+        total = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        return total, trainable
+
+    def _print_param_counts(self):
+        """Log parameter counts for the full model + each component."""
+        model_name = self.hparams.get('model', 'deit_small_patch16_224')
+        feat_t, feat_tr = self._count_params(self.featurizer)
+        head_t, head_tr = self._count_params(self.moe_head)
+
+        # Per-expert breakdown inside the MoE head
+        expert_t = sum(p.numel() for p in self.moe_head.experts.parameters())
+        router_t = sum(p.numel() for p in self.moe_head.router.parameters())
+        clf_t = sum(p.numel() for p in self.moe_head.classifier.parameters())
+
+        extra_t = extra_tr = 0
+        if getattr(self, 'discriminators', None) is not None:
+            extra_t, extra_tr = self._count_params(self.discriminators)
+
+        total_t = feat_t + head_t + extra_t
+        total_tr = feat_tr + head_tr + extra_tr
+
+        def fmt(n):
+            return f'{n:>13,}  ({n / 1e6:6.2f}M)'
+
+        print(f'\n[{type(self).__name__}] param counts  —  backbone={model_name}')
+        print(f'  featurizer (ViT)       : {fmt(feat_t)}  trainable={fmt(feat_tr)}')
+        print(f'  moe_head total         : {fmt(head_t)}  trainable={fmt(head_tr)}')
+        print(f'    ├─ experts ({self.moe_head.num_experts}×)         : {fmt(expert_t)}')
+        print(f'    ├─ router              : {fmt(router_t)}')
+        print(f'    └─ classifier          : {fmt(clf_t)}')
+        if extra_t > 0:
+            print(f'  discriminators         : {fmt(extra_t)}  trainable={fmt(extra_tr)}')
+        print(f'  ─────────────────────────────────────────────')
+        print(f'  TOTAL                  : {fmt(total_t)}  trainable={fmt(total_tr)}\n')
+
     def _forward(self, x):
         """Returns (logits, pi, h_stack)."""
         z = self.featurizer(x)
