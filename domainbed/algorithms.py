@@ -709,8 +709,13 @@ class GMoEVariantBase(nn.Module):
         self.hparams = hparams
         self.num_classes = num_classes
         self.num_domains = num_domains
+        model_name = hparams.get('model', 'deit_small_patch16_224')
+        
+        self.featurizer = DeiTFeaturizer(
+            model_name=model_name,
+            pretrained=True,
+        ).cuda()
 
-        self.featurizer = DeiTFeaturizer(pretrained=True).cuda()
         self.moe_head = ExplicitMoEHead(
             in_dim=self.featurizer.n_outputs,
             expert_dim=self.EXPERT_DIM,
