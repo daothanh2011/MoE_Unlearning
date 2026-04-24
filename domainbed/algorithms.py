@@ -717,6 +717,7 @@ class GMoEVariantBase(nn.Module):
         prune_ratio  = hparams.get('expert_prune_ratio', 0.0)
         expert_depth = hparams.get('expert_depth',       2)
         model_name   = hparams.get('model',              'deit_small_patch16_224')
+        freeze_backbone = hparams.get('freeze_backbone', False)
 
         # gate_k is accepted for CLI/sweep compatibility with the original GMOE
         # but does not apply to soft routing (our router is a weighted sum
@@ -730,6 +731,18 @@ class GMoEVariantBase(nn.Module):
             model_name=model_name,
             pretrained=True,
         ).cuda()
+
+        # Optional freeze — disables gradients on backbone params and forces
+        # eval mode so BatchNorm / Dropout stats don't drift.  Params with
+        # requires_grad=False are filtered out of the optimizer below so
+        # Adam doesn't allocate moments for them (saves memory).
+        self.freeze_backbone = freeze_backbone
+        if freeze_backbone:
+            for p in self.featurizer.parameters():
+                p.requires_grad_(False)
+            self.featurizer.eval()
+            print(f'[{type(self).__name__}] backbone FROZEN — '
+                  f'only moe_head (+ discriminators if any) will be trained')
 
         # ---- Explicit MoE head ----
         # expert_dim defaults to the ViT embed_dim so each expert outputs at
@@ -754,6 +767,18 @@ class GMoEVariantBase(nn.Module):
 
         self._print_param_counts()
 
+    def train(self, mode=True):
+        """
+        Override train() so a frozen backbone stays in eval mode even when
+        the outer module is set to train.  nn.Module.train() normally flips
+        everything, which would re-enable Dropout / BN updates in the
+        frozen backbone.
+        """
+        super().train(mode)
+        if getattr(self, 'freeze_backbone', False):
+            self.featurizer.eval()
+        return self
+
     def _count_params(self, module):
         """Return (total, trainable) parameter counts for a module."""
         total = sum(p.numel() for p in module.parameters())
@@ -762,7 +787,7 @@ class GMoEVariantBase(nn.Module):
 
     def _print_param_counts(self):
         """Log parameter counts for the full model + each component."""
-        model_name = self.hparams.get('model', 'deit_small_patch16_224')
+        model_name = self.featurizer.model_name
         feat_t, feat_tr = self._count_params(self.featurizer)
         head_t, head_tr = self._count_params(self.moe_head)
 
@@ -782,7 +807,11 @@ class GMoEVariantBase(nn.Module):
             return f'{n:>13,}  ({n / 1e6:6.2f}M)'
 
         print(f'\n[{type(self).__name__}] param counts  —  backbone={model_name}')
-        print(f'  featurizer (ViT)       : {fmt(feat_t)}  trainable={fmt(feat_tr)}')
+        print(f'  num_experts={self.moe_head.num_experts}  '
+              f'expert_dim={self.moe_head.expert_dim}  '
+              f'expert_depth={self.moe_head.expert_depth}')
+        frozen_tag = '  [FROZEN]' if getattr(self, 'freeze_backbone', False) else ''
+        print(f'  featurizer (ViT){frozen_tag}: {fmt(feat_t)}  trainable={fmt(feat_tr)}')
         print(f'  moe_head total         : {fmt(head_t)}  trainable={fmt(head_tr)}')
         print(f'    ├─ experts ({self.moe_head.num_experts}×)         : {fmt(expert_t)}')
         print(f'    ├─ router              : {fmt(router_t)}')
