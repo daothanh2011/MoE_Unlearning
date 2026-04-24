@@ -1,62 +1,167 @@
-# gmoe_utils.py
-# Shared building blocks for GMoE variants:
-#   - DeiTFeaturizer   — pretrained DeiT-small backbone (CLS token output)
-#   - ExplicitMoEHead  — M expert MLPs + soft router + classifier
-#   - loss functions   — inv_A, inv_B, sparse, balance, diversity, cond_independence
+# # gmoe_utils.py
+# # Shared building blocks for GMoE variants:
+# #   - DeiTFeaturizer   — pretrained DeiT-small backbone (CLS token output)
+# #   - ExplicitMoEHead  — M expert MLPs + soft router + classifier
+# #   - loss functions   — inv_A, inv_B, sparse, balance, diversity, cond_independence
+#
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+#
+# from domainbed import vision_transformer as vit_module
+#
+#
+# # ---------------------------------------------------------------------------
+# # Backbone
+# # ---------------------------------------------------------------------------
+#
+# class DeiTFeaturizer(nn.Module):
+#     """
+#     Wraps the repo's VisionTransformer (DeiT-small config) to expose the
+#     CLS-token feature vector.  All layers are dense ('F') — no MoE, no Tutel.
+#     Instantiates VisionTransformer directly, bypassing timm's model registry
+#     so there is no conflict with the repo's @register_model decorators.
+#     embed_dim = 384 for deit_small.
+#     """
+#     def __init__(self, pretrained=True):
+#         super().__init__()
+#         self.vit = vit_module.VisionTransformer(
+#             img_size=224, patch_size=16, in_chans=3,
+#             num_classes=0,           # no head — returns raw features
+#             embed_dim=384, depth=12, num_heads=6,
+#             mlp_ratio=4., qkv_bias=True,
+#             distilled=True,          # DeiT-small checkpoint has distillation token
+#             drop_path_rate=0.1,
+#             moe_layers=['F'] * 12,   # all-dense, no Tutel
+#             num_experts=1,
+#             router='cosine_top',
+#         )
+#         self.n_outputs = 384
+#
+#         if pretrained:
+#             checkpoint = torch.hub.load_state_dict_from_url(
+#                 'https://dl.fbaipublicfiles.com/deit/deit_small_distilled_patch16_224-649709d9.pth',
+#                 map_location='cpu', check_hash=True,
+#             )
+#             state = checkpoint.get('model', checkpoint)
+#             # Drop classifier head keys — not present when num_classes=0
+#             state = {k: v for k, v in state.items()
+#                      if not k.startswith('head')}
+#             missing, _ = self.vit.load_state_dict(state, strict=False)
+#             if missing:
+#                 print(f'[DeiTFeaturizer] missing keys (expected if head removed): {missing}')
+#
+#     def forward(self, x):
+#         # forward_features returns (cls, dist) tuple for distilled DeiT
+#         out = self.vit.forward_features(x)
+#         if isinstance(out, tuple):
+#             return out[0]   # CLS token → (B, 384)
+#         return out
+
+
+# deit_transformer.py
+# Pretrained ViT/DeiT backbone used by the GMoE variants.
+#
+# Supports any model registered in vision_transformer.py — the model name is
+# provided via hparams['model'] (or directly to the constructor).  The
+# factory function is looked up by name and called with dense 'F'-only
+# moe_layers so the backbone acts as a pure feature extractor (no MoE).
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from domainbed import vision_transformer as vit_module
 
 
 # ---------------------------------------------------------------------------
-# Backbone
+# Default config for each supported model.
+#
+# We hard-code embed_dim and depth here so DeiTFeaturizer can construct
+# moe_layers = ['F'] * depth and expose n_outputs = embed_dim without
+# having to import Python internals from the registered factory functions.
+#
+# Keys mirror the @register_model names in vision_transformer.py.
 # ---------------------------------------------------------------------------
+_MODEL_CONFIG = {
+    # DeiT family
+    'deit_tiny_patch16_224':    {'embed_dim': 192, 'depth': 12},
+    'deit_small_patch16_224':   {'embed_dim': 384, 'depth': 12},
+    'deit_base_patch16_224':    {'embed_dim': 768, 'depth': 12},
+    'deit_base_patch16_384':    {'embed_dim': 768, 'depth': 12},
+    # DeiT distilled family
+    'deit_tiny_distilled_patch16_224':  {'embed_dim': 192, 'depth': 12},
+    'deit_small_distilled_patch16_224': {'embed_dim': 384, 'depth': 12},
+    'deit_base_distilled_patch16_224':  {'embed_dim': 768, 'depth': 12},
+    'deit_base_distilled_patch16_384':  {'embed_dim': 768, 'depth': 12},
+    # ViT family
+    'vit_tiny_patch16_224':     {'embed_dim': 192, 'depth': 12},
+    'vit_small_patch16_224':    {'embed_dim': 384, 'depth': 12},
+    'vit_small_patch32_224':    {'embed_dim': 384, 'depth': 12},
+    'vit_base_patch16_224':     {'embed_dim': 768, 'depth': 12},
+    'vit_base_patch32_224':     {'embed_dim': 768, 'depth': 12},
+    'vit_base_patch8_224':      {'embed_dim': 768, 'depth': 12},
+    'vit_large_patch16_224':    {'embed_dim': 1024, 'depth': 24},
+    'vit_large_patch32_224':    {'embed_dim': 1024, 'depth': 24},
+    'vit_huge_patch14_224':     {'embed_dim': 1280, 'depth': 32},
+}
+
 
 class DeiTFeaturizer(nn.Module):
     """
-    Wraps the repo's VisionTransformer (DeiT-small config) to expose the
-    CLS-token feature vector.  All layers are dense ('F') — no MoE, no Tutel.
-    Instantiates VisionTransformer directly, bypassing timm's model registry
-    so there is no conflict with the repo's @register_model decorators.
-    embed_dim = 384 for deit_small.
-    """
-    def __init__(self, pretrained=True):
-        super().__init__()
-        self.vit = vit_module.VisionTransformer(
-            img_size=224, patch_size=16, in_chans=3,
-            num_classes=0,           # no head — returns raw features
-            embed_dim=384, depth=12, num_heads=6,
-            mlp_ratio=4., qkv_bias=True,
-            distilled=True,          # DeiT-small checkpoint has distillation token
-            drop_path_rate=0.1,
-            moe_layers=['F'] * 12,   # all-dense, no Tutel
-            num_experts=1,
-            router='cosine_top',
-        )
-        self.n_outputs = 384
+    Size-agnostic ViT/DeiT backbone that exposes the CLS-token feature
+    vector.  The concrete model is selected by name from vision_transformer's
+    @register_model registry, so any model defined in that file can be used
+    just by passing its name.
 
-        if pretrained:
-            checkpoint = torch.hub.load_state_dict_from_url(
-                'https://dl.fbaipublicfiles.com/deit/deit_small_distilled_patch16_224-649709d9.pth',
-                map_location='cpu', check_hash=True,
-            )
-            state = checkpoint.get('model', checkpoint)
-            # Drop classifier head keys — not present when num_classes=0
-            state = {k: v for k, v in state.items()
-                     if not k.startswith('head')}
-            missing, _ = self.vit.load_state_dict(state, strict=False)
-            if missing:
-                print(f'[DeiTFeaturizer] missing keys (expected if head removed): {missing}')
+    Args:
+        model_name: any key in _MODEL_CONFIG (default 'deit_small_patch16_224').
+        pretrained: load the registered checkpoint URL for the chosen model.
+
+    Attributes:
+        n_outputs (int): embedding dim of the chosen model — used by
+            downstream ExplicitMoEHead to size its input layer.
+    """
+    def __init__(self, model_name='deit_small_patch16_224', pretrained=True):
+        super().__init__()
+        if model_name not in _MODEL_CONFIG:
+            raise ValueError(
+                f'Unknown model {model_name!r}. '
+                f'Supported: {sorted(_MODEL_CONFIG.keys())}')
+
+        cfg   = _MODEL_CONFIG[model_name]
+        depth = cfg['depth']
+
+        # Look up the factory by name. _create_vision_transformer handles the
+        # pretrained weight loading and position-embed resizing internally —
+        # we just need to pass num_classes=0 (drop head) and moe_layers all 'F'
+        # (no MoE inside the backbone; MoE happens in ExplicitMoEHead on top).
+        factory = getattr(vit_module, model_name)
+        self.vit = factory(
+            pretrained   = pretrained,
+            num_classes  = 0,                  # no head — returns features
+            moe_layers   = ['F'] * depth,      # all-dense, no Tutel
+            num_experts  = 1,                  # ignored when all 'F'
+            gate_k       = 1,                  # ignored when all 'F'
+            prune_ratio  = 0.0,
+            router       = 'cosine_top',       # ignored when all 'F'
+            is_tutel     = False,
+            expert_depth = 2,                  # ignored when all 'F'
+            drop_path_rate = 0.1,
+        )
+        self.n_outputs  = cfg['embed_dim']
+        self.model_name = model_name
 
     def forward(self, x):
         # forward_features returns (cls, dist) tuple for distilled DeiT
         out = self.vit.forward_features(x)
         if isinstance(out, tuple):
-            return out[0]   # CLS token → (B, 384)
+            return out[0]        # CLS token → (B, embed_dim)
         return out
+
+
+def supported_models():
+    """Names accepted by DeiTFeaturizer(model_name=...)."""
+    return sorted(_MODEL_CONFIG.keys())
 
 
 # ---------------------------------------------------------------------------
