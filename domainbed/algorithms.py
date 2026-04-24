@@ -962,8 +962,6 @@ class GMOE_Full(GMoEVariantBase):
 
         # --- resolve inv_type (with legacy use_inv_b shim) ---
         inv_type = hparams.get('inv_type', 'A')
-        if hparams.get('use_inv_b', False):
-            inv_type = 'B'
         if inv_type not in self._VALID_INV_TYPES:
             raise ValueError(
                 f'inv_type={inv_type!r} not in {sorted(self._VALID_INV_TYPES)}')
@@ -1027,7 +1025,6 @@ class GMOE_Full(GMoEVariantBase):
             'loss_sp':  l_sp.item(),
             'loss_bal': l_bal.item(),
             'loss_div': l_div.item(),
-            'inv_type': self.inv_type,
         }
 
 
