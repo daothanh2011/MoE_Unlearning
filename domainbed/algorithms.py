@@ -904,75 +904,130 @@ class GMOE_InvB(GMoEVariantBase):
 # Variant Full: all six loss terms
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Variant Full: unified objective over multiple invariance types
+# ---------------------------------------------------------------------------
+
 class GMOE_Full(GMoEVariantBase):
     """
-    L = L_cls
-      + lambda_inv  * L_inv   (A or B depending on use_inv_b)
-      + lambda_sp   * L_sp    (sparsity / routing entropy)
-      + lambda_bal  * L_bal   (load balancing)
-      + lambda_div  * L_div   (expert diversity)
-      + lambda_cind * L_cind  (conditional independence)
+    Unified full-objective variant.  Dispatches the invariance term across
+    five variants via the `inv_type` hparam:
 
-    Hparams:
+        inv_type = 'A'     → Option A  (first-order mean alignment)
+                   'B'     → Option B  (mean + covariance alignment)
+                   'MMD'   → conditional MMD²  (multi-bandwidth RBF)
+                   'OT'    → conditional entropic Wasserstein (Sinkhorn)
+                   'ED'    → conditional energy distance
+
+    Total objective:
+        L = L_cls
+          + lambda_inv * L_inv_<inv_type>
+          + lambda_sp  * L_sp    (sparsity / routing entropy)
+          + lambda_bal * L_bal   (load balancing)
+          + lambda_div * L_div   (expert diversity)
+
+    (Conditional-independence term L_cind is intentionally removed.)
+
+    Common hparams:
+        inv_type    (str,   default 'A')
         lambda_inv  (float, default 0.1)
         lambda_sp   (float, default 0.01)
         lambda_bal  (float, default 0.01)
         lambda_div  (float, default 0.01)
-        lambda_cind (float, default 0.01)
-        alpha_cov   (float, default 0.1)   covariance weight inside L_inv^B
-        use_inv_b   (bool,  default False)  use Option B invariance instead of A
+
+    Variant-specific hparams (only those matching inv_type are used):
+        B    : alpha_cov       (float, default 0.1)
+        MMD  : alpha           (float, default 4.0)
+               mmd_sigmas      (tuple, default (1,2,4,8,16))
+        OT   : alpha           (float, default 4.0)
+               ot_epsilon      (float, default 0.1)
+               sinkhorn_iters  (int,   default 50)
+        ED   : alpha           (float, default 4.0)
+
+    Legacy compatibility:
+        Setting `use_inv_b=True` is still accepted and overrides inv_type
+        to 'B' for backwards compatibility with earlier experiments.
     """
+
+    _VALID_INV_TYPES = {'A', 'B', 'MMD', 'OT', 'ED'}
 
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super().__init__(input_shape, num_classes, num_domains, hparams)
-        self.lambda_inv = hparams.get('lambda_inv', 0.1)
-        self.lambda_sp = hparams.get('lambda_sp', 0.01)
+
+        # --- common weights ---
+        self.lambda_inv = hparams.get('lambda_inv', 0.01)
+        self.lambda_sp  = hparams.get('lambda_sp',  0.01)
         self.lambda_bal = hparams.get('lambda_bal', 0.01)
         self.lambda_div = hparams.get('lambda_div', 0.01)
-        self.lambda_cind = hparams.get('lambda_cind', 0.01)
-        self.alpha_cov = hparams.get('alpha_cov', 0.1)
-        self.use_inv_b = hparams.get('use_inv_b', False)
+
+        # --- resolve inv_type (with legacy use_inv_b shim) ---
+        inv_type = hparams.get('inv_type', 'A')
+        if hparams.get('use_inv_b', False):
+            inv_type = 'B'
+        if inv_type not in self._VALID_INV_TYPES:
+            raise ValueError(
+                f'inv_type={inv_type!r} not in {sorted(self._VALID_INV_TYPES)}')
+        self.inv_type = inv_type
+
+        # --- variant-specific hparams (only the relevant ones are read) ---
+        self.alpha_cov      = hparams.get('alpha_cov',      0.1)
+        self.alpha          = hparams.get('alpha',          4.0)
+        self.sigmas         = tuple(hparams.get('mmd_sigmas', (1., 2., 4., 8., 16.)))
+        self.epsilon        = hparams.get('ot_epsilon',     0.1)
+        self.sinkhorn_iters = hparams.get('sinkhorn_iters', 50)
+
+    def _compute_invariance(self, h_stack, pi, all_y, dom_id):
+        """Dispatch to the selected invariance loss."""
+        C, D = self.num_classes, self.num_domains
+        if self.inv_type == 'A':
+            return loss_inv_A(h_stack, pi, all_y, C, dom_id, D)
+        if self.inv_type == 'B':
+            return loss_inv_B(h_stack, pi, all_y, C, dom_id, D,
+                              alpha=self.alpha_cov)
+        if self.inv_type == 'MMD':
+            return loss_inv_MMD(h_stack, pi, all_y, C, dom_id, D,
+                                alpha=self.alpha, sigmas=self.sigmas)
+        if self.inv_type == 'OT':
+            return loss_inv_OT(h_stack, pi, all_y, C, dom_id, D,
+                               alpha=self.alpha,
+                               epsilon=self.epsilon,
+                               sinkhorn_iters=self.sinkhorn_iters)
+        if self.inv_type == 'ED':
+            return loss_inv_ED(h_stack, pi, all_y, C, dom_id, D,
+                               alpha=self.alpha)
+        raise RuntimeError(f'unreachable: inv_type={self.inv_type}')
 
     def update(self, minibatches, unlabeled=None):
-        all_x = torch.cat([x for x, y in minibatches])
-        all_y = torch.cat([y for x, y in minibatches])
+        all_x  = torch.cat([x for x, y in minibatches])
+        all_y  = torch.cat([y for x, y in minibatches])
         dom_id = self._get_domain_ids(minibatches)
 
         logits, pi, h_stack = self._forward(all_x)
 
         l_cls = F.cross_entropy(logits, all_y)
-
-        if self.use_inv_b:
-            l_inv = loss_inv_B(h_stack, pi, all_y, self.num_classes,
-                               dom_id, self.num_domains, alpha=self.alpha_cov)
-        else:
-            l_inv = loss_inv_A(h_stack, pi, all_y, self.num_classes,
-                               dom_id, self.num_domains)
-
-        l_sp = loss_sparse(pi)
+        l_inv = self._compute_invariance(h_stack, pi, all_y, dom_id)
+        l_sp  = loss_sparse(pi)
         l_bal = loss_balance(pi)
         l_div = loss_diversity(h_stack)
-        l_cind = loss_cond_independence(h_stack, all_y, self.num_classes)
 
         loss = (l_cls
                 + self.lambda_inv * l_inv
-                + self.lambda_sp * l_sp
+                + self.lambda_sp  * l_sp
                 + self.lambda_bal * l_bal
-                + self.lambda_div * l_div
-                + self.lambda_cind * l_cind)
+                + self.lambda_div * l_div)
 
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
         return {
-            'loss': loss.item(),
+            'loss':     loss.item(),
             'loss_cls': l_cls.item(),
             'loss_inv': l_inv.item(),
-            'loss_sp': l_sp.item(),
+            'loss_sp':  l_sp.item(),
             'loss_bal': l_bal.item(),
             'loss_div': l_div.item(),
-            'loss_cind': l_cind.item(),
+            'inv_type': self.inv_type,
         }
 
 
