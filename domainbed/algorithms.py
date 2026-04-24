@@ -709,18 +709,41 @@ class GMoEVariantBase(nn.Module):
         self.hparams = hparams
         self.num_classes = num_classes
         self.num_domains = num_domains
-        model_name = hparams.get('model', 'deit_small_patch16_224')
-        
+
+        # ---- Architecture hparams (matches original GMOE / GMoEOMoE names) ----
+        num_experts  = hparams.get('num_experts',        self.NUM_EXPERTS)
+        gate_k       = hparams.get('gate_k',             1)
+        mlp_ratio    = hparams.get('mlp_ratio',          4.0)
+        prune_ratio  = hparams.get('expert_prune_ratio', 0.0)
+        expert_depth = hparams.get('expert_depth',       2)
+        model_name   = hparams.get('model',              'deit_small_patch16_224')
+
+        # gate_k is accepted for CLI/sweep compatibility with the original GMOE
+        # but does not apply to soft routing (our router is a weighted sum
+        # over all experts).  Warn if someone asks for hard top-k.
+        if gate_k != 1:
+            print(f'[GMoEVariantBase] gate_k={gate_k} requested but soft routing '
+                  f'uses all experts — gate_k is ignored.')
+
+        # ---- Backbone ----
         self.featurizer = DeiTFeaturizer(
             model_name=model_name,
             pretrained=True,
         ).cuda()
 
+        # ---- Explicit MoE head ----
+        # expert_dim defaults to the ViT embed_dim so each expert outputs at
+        # the same scale as the backbone features (matches the paper's r = D).
+        expert_dim = hparams.get('expert_dim', self.featurizer.n_outputs)
+
         self.moe_head = ExplicitMoEHead(
             in_dim=self.featurizer.n_outputs,
-            expert_dim=self.EXPERT_DIM,
-            num_experts=self.NUM_EXPERTS,
+            expert_dim=expert_dim,
+            num_experts=num_experts,
             num_classes=num_classes,
+            mlp_ratio=mlp_ratio,
+            prune_ratio=prune_ratio,
+            expert_depth=expert_depth,
         ).cuda()
 
         self.optimizer = torch.optim.Adam(

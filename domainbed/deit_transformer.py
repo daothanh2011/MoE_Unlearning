@@ -184,14 +184,16 @@ class ExplicitMoEHead(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.expert_dim  = expert_dim
+        self.expert_depth = expert_depth
 
-        # M expert MLPs: each z → r
+        if mlp_ratio is not None:
+            hidden = max(1, int(in_dim * mlp_ratio * (1.0 - prune_ratio)))
+        else:
+            hidden = expert_dim
+
+        # Build each expert as a variable-depth MLP: in_dim → hidden → ... → expert_dim
         self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(in_dim, expert_dim),
-                nn.GELU(),
-                nn.Linear(expert_dim, expert_dim),
-            )
+            self._make_expert(in_dim, hidden, expert_dim, expert_depth)
             for _ in range(num_experts)
         ])
 
@@ -200,6 +202,37 @@ class ExplicitMoEHead(nn.Module):
 
         # Final classifier: r → num_classes
         self.classifier = nn.Linear(expert_dim, num_classes)
+
+    @staticmethod
+    def _make_expert(in_dim, hidden, out_dim, depth):
+        """
+        Build an N-layer MLP:
+          depth=2 : in → hidden → out
+          depth=3 : in → hidden → hidden → out
+          depth=N : in → hidden → ... (N-2 hidden→hidden layers) ... → hidden → out
+        GELU between every linear; no activation after the final layer.
+        Middle hidden→hidden layers are initialised as identity so the expert
+        is near-pass-through at the start of training (matches repo's DeepExpert).
+        """
+        dims = [in_dim] + [hidden] * (depth - 1) + [out_dim]
+        layers = []
+        for i in range(depth):
+            lin = nn.Linear(dims[i], dims[i + 1])
+            layers.append(lin)
+            if i < depth - 1:
+                layers.append(nn.GELU())
+        mlp = nn.Sequential(*layers)
+
+        # Identity init on middle hidden→hidden layers (indices 1 .. depth-2)
+        for idx in range(1, depth - 1):
+            # each Linear is at position 2*idx in the Sequential (every linear
+            # is followed by a GELU, so Linears are at even indices 0, 2, 4, ...)
+            layer = mlp[2 * idx]
+            if layer.weight.shape[0] == layer.weight.shape[1]:
+                nn.init.eye_(layer.weight)
+                nn.init.zeros_(layer.bias)
+
+        return mlp
 
     def forward(self, z):
         """
