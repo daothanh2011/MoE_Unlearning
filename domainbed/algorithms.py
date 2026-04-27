@@ -30,6 +30,7 @@ from domainbed import networks
 # from domainbed import resnet_variants
 import torchvision.models as models
 from domainbed.losses.moe_specialization_losses import OrthoLoss, VarianceLoss
+from domainbed.losses.matchdg_utils import *
 from domainbed.losses.gmoe_utils import *
 from domainbed.deit_transformer import *
 
