@@ -159,6 +159,140 @@ class ColoredMNIST(MultipleEnvironmentMNIST):
         return (a - b).abs()
 
 
+class ColoredMNIST_E(MultipleEnvironmentMNIST):
+    """ColoredMNIST with a configurable number of training environments E.
+
+    Protocol from Wang et al., "Lost Domain Generalization Is a Natural
+    Consequence of Lack of Training Domains", AAAI 2024.
+    """
+    # Class-level placeholder of length default_E + 1 = 9, so that
+    # datasets.num_environments("ColoredMNIST_E") works before the dataset
+    # is instantiated (e.g. in test_datasets.py). The real, p_e-annotated
+    # names are written to self.ENVIRONMENTS in __init__.
+    ENVIRONMENTS = [f'env_{i}' for i in range(9)]
+
+    def __init__(self, root, test_envs, hparams):
+        E = int(hparams.get('num_environments', 8))
+        if E < 2:
+            raise ValueError(f"num_environments must be >= 2, got {E}")
+
+        candidates = np.linspace(1.0 / (E + 2), (E + 1) / (E + 2), E + 1)
+        drop_idx = int(np.argmin(np.abs(candidates - 0.5)))
+        train_p = np.delete(candidates, drop_idx).tolist()
+
+        environments = train_p + [0.5]
+        self.ENVIRONMENTS = [f'p={p:.3f}' for p in environments]
+
+        super().__init__(root, environments, self.color_dataset,
+                         (2, 28, 28,), 2)
+        self.input_shape = (2, 28, 28,)
+        self.num_classes = 2
+
+    def color_dataset(self, images, labels, environment):
+        labels = (labels < 5).float()
+        labels = self.torch_xor_(labels,
+                                 self.torch_bernoulli_(0.25, len(labels)))
+        colors = self.torch_xor_(labels,
+                                 self.torch_bernoulli_(environment,
+                                                       len(labels)))
+        images = torch.stack([images, images], dim=1)
+        images[torch.tensor(range(len(images))),
+               (1 - colors).long(), :, :] *= 0
+        x = images.float().div_(255.0)
+        y = labels.view(-1).long()
+        return TensorDataset(x, y)
+
+    def torch_bernoulli_(self, p, size):
+        return (torch.rand(size) < p).float()
+
+    def torch_xor_(self, a, b):
+        return (a - b).abs()
+
+
+class ColoredMNIST_K(MultipleDomainDataset):
+    """ColoredMNIST with K source domains + 1 fixed test domain (p=0.5).
+
+    Sample budget (fixed across K):
+      - test env: exactly `test_size` samples (default 10000), p_color = 0.5
+      - source envs: remaining (70000 - test_size) split equally across K
+        (any remainder < K is dropped)
+
+    Source p_color values: linspace(1/(K+2), (K+1)/(K+2), K+1) with the value
+    closest to 0.5 dropped. Test env appended at index K (last).
+    """
+    ENVIRONMENTS = [f'env_{i}' for i in range(10)]
+
+    def __init__(self, root, test_envs, hparams):
+        super().__init__()
+        if root is None:
+            raise ValueError('Data directory not specified!')
+        K = int(hparams.get('num_source_domains', 9))
+        if K < 2:
+            raise ValueError(f"num_source_domains must be >= 2, got {K}")
+        test_size = int(hparams.get('test_size', 10000))
+
+        original_dataset_tr = MNIST(root, train=True, download=True)
+        original_dataset_te = MNIST(root, train=False, download=True)
+        original_images = torch.cat((original_dataset_tr.data,
+                                     original_dataset_te.data))
+        original_labels = torch.cat((original_dataset_tr.targets,
+                                     original_dataset_te.targets))
+
+        N_total = len(original_images)
+        if test_size >= N_total:
+            raise ValueError(
+                f"test_size ({test_size}) must be < total MNIST ({N_total})")
+        N_train = N_total - test_size
+        per_env = N_train // K
+        if per_env < 1:
+            raise ValueError(
+                f"K={K} too large for source pool of {N_train} samples")
+
+        shuffle = torch.randperm(N_total)
+        original_images = original_images[shuffle]
+        original_labels = original_labels[shuffle]
+
+        train_imgs = original_images[: K * per_env]
+        train_lbls = original_labels[: K * per_env]
+        test_imgs = original_images[N_train: N_train + test_size]
+        test_lbls = original_labels[N_train: N_train + test_size]
+
+        candidates = np.linspace(1.0 / (K + 2), (K + 1) / (K + 2), K + 1)
+        drop_idx = int(np.argmin(np.abs(candidates - 0.5)))
+        train_p = np.delete(candidates, drop_idx).tolist()
+        self.ENVIRONMENTS = [f'p={p:.3f}' for p in train_p] + ['p=0.500']
+
+        self.datasets = []
+        for i, p in enumerate(train_p):
+            ei = train_imgs[i * per_env: (i + 1) * per_env]
+            el = train_lbls[i * per_env: (i + 1) * per_env]
+            self.datasets.append(self.color_dataset(ei, el, p))
+        self.datasets.append(self.color_dataset(test_imgs, test_lbls, 0.5))
+
+        self.input_shape = (2, 28, 28,)
+        self.num_classes = 2
+
+    def color_dataset(self, images, labels, environment):
+        labels = (labels < 5).float()
+        labels = self.torch_xor_(labels,
+                                 self.torch_bernoulli_(0.25, len(labels)))
+        colors = self.torch_xor_(labels,
+                                 self.torch_bernoulli_(environment,
+                                                       len(labels)))
+        images = torch.stack([images, images], dim=1)
+        images[torch.tensor(range(len(images))),
+               (1 - colors).long(), :, :] *= 0
+        x = images.float().div_(255.0)
+        y = labels.view(-1).long()
+        return TensorDataset(x, y)
+
+    def torch_bernoulli_(self, p, size):
+        return (torch.rand(size) < p).float()
+
+    def torch_xor_(self, a, b):
+        return (a - b).abs()
+
+
 class RotatedMNIST(MultipleEnvironmentMNIST):
     ENVIRONMENTS = ['0', '15', '30', '45', '60', '75']
 
