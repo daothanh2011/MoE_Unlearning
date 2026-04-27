@@ -91,6 +91,18 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('vrex_penalty_anneal_iters', 500,
                 lambda r: int(10 ** r.uniform(0, 4)))
 
+    elif algorithm == 'MatchDG':
+        _hparam('matchdg_phase1_steps', 1500,
+                lambda r: int(r.choice([1000, 1500, 2000])))
+        _hparam('matchdg_lambda_match', 1.0,
+                lambda r: 10 ** r.uniform(-1, 1))
+        _hparam('matchdg_tau', 0.1,
+                lambda r: r.choice([0.05, 0.1, 0.2, 0.5]))
+        _hparam('matchdg_match_update_freq', 100, lambda r: 100)
+        _hparam('matchdg_phase1_lr', None, lambda r: None)
+        _hparam('matchdg_proj_dim', None,
+                lambda r: r.choice([None, 128, 256]))
+
     elif algorithm == "SD":
         _hparam('sd_reg', 0.1, lambda r: 10 ** r.uniform(-5, -1))
 
