@@ -77,7 +77,7 @@ def main():
     args = parser.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    for K in [2, 5, 10]:
+    for K in [2,3,4,5,6,7,8,9,10]:
         ds = build(args.data_dir, K)
         print(f"K={K}: envs={len(ds)}  names={ds.ENVIRONMENTS}")
         for i, name in enumerate(ds.ENVIRONMENTS):
