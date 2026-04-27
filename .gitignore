@@ -41,3 +41,4 @@ exps/eval_outputs/
 *.DS_Store
 .env
 *.log
+results/
