@@ -271,6 +271,11 @@ class ColoredMNIST_K(MultipleDomainDataset):
 
         self.input_shape = (2, 28, 28,)
         self.num_classes = 2
+        
+        # In your training script, right after the dataset is constructed:
+        print(f"len(dataset) = {len(dataset)}")
+        print(f"dataset.ENVIRONMENTS = {dataset.ENVIRONMENTS}")
+        print(f"hparams['num_source_domains'] = {hparams.get('num_source_domains')}")
 
     def color_dataset(self, images, labels, environment):
         labels = (labels < 5).float()
