@@ -145,8 +145,7 @@ class ColoredMNIST(MultipleEnvironmentMNIST):
                                                        len(labels)))
         images = torch.stack([images, images], dim=1)
         # Apply the color to the image by zeroing out the other color channel
-        images[torch.tensor(range(len(images))), (
-                                                         1 - colors).long(), :, :] *= 0
+        images[torch.tensor(range(len(images))), (1 - colors).long(), :, :] *= 0
 
         x = images.float().div_(255.0)
         y = labels.view(-1).long()
@@ -315,6 +314,126 @@ class RotatedMNIST(MultipleEnvironmentMNIST):
         y = labels.view(-1)
 
         return TensorDataset(x, y)
+
+
+class RotatedColoredMNIST_K(MultipleDomainDataset):
+    """Rotated + Colored MNIST grid: i rotation angles x 10 color p values.
+
+    Builds a full grid of i*10 environments. The user selects which
+    environment(s) to hold out as test via the standard DomainBed
+    `test_envs` argument (handled externally; this class just exposes all
+    envs).
+
+    Rotation angles: [0, 15, 30, ..., 15*(i-1)] (i angles, 15 deg step).
+      Constraint: 1 <= i <= 13 (so max angle is 15*12 = 180).
+    Color p values: [0.0, 0.1, 0.2, ..., 0.9] (always 10 values).
+
+    Env indexing: env (ri, ci) -> index ri * 10 + ci, where ri is the
+    rotation index (0..i-1) and ci is the color index (0..9).
+
+    Sample budget: full MNIST (70000 samples) shuffled and split equally
+    across the i*10 envs (any remainder < i*10 is dropped).
+    """
+    ENVIRONMENTS = [f'env_{k}' for k in range(130)]  # placeholder, overridden in __init__
+
+    def __init__(self, root, test_envs, hparams):
+        super().__init__()
+        if root is None:
+            raise ValueError('Data directory not specified!')
+
+        i = int(hparams.get('num_rotation_domains', 3))
+        if i < 1 or i > 13:
+            raise ValueError(
+                f"num_rotation_domains must be in [1, 13], got {i}")
+        j = 10  # always 10 color p values: [0.0, 0.1, ..., 0.9]
+
+        # ---- Load full MNIST (train + test pooled) ----
+        original_dataset_tr = MNIST(root, train=True, download=True)
+        original_dataset_te = MNIST(root, train=False, download=True)
+        original_images = torch.cat((original_dataset_tr.data,
+                                     original_dataset_te.data))
+        original_labels = torch.cat((original_dataset_tr.targets,
+                                     original_dataset_te.targets))
+
+        N_total = len(original_images)
+        n_envs = i * j  # i * 10
+        per_env = N_total // n_envs
+        if per_env < 1:
+            raise ValueError(
+                f"i*10={n_envs} too large for MNIST pool of {N_total} samples")
+
+        shuffle = torch.randperm(N_total)
+        original_images = original_images[shuffle]
+        original_labels = original_labels[shuffle]
+
+        # Trim to a multiple of n_envs
+        original_images = original_images[: n_envs * per_env]
+        original_labels = original_labels[: n_envs * per_env]
+
+        # ---- Per-axis env params ----
+        # Rotation: i fixed 15-degree-step angles starting from 0
+        rotation_angles = [15.0 * k for k in range(i)]            # length i
+        # Color: 10 fixed p values starting from 0.0 with step 0.1
+        color_ps = [0.1 * k for k in range(j)]                    # length 10
+
+        # ---- Build all envs: outer over rotation, inner over color ----
+        env_names = []
+        self.datasets = []
+        for ri, angle in enumerate(rotation_angles):
+            for ci, p in enumerate(color_ps):
+                idx = ri * j + ci
+                ei = original_images[idx * per_env: (idx + 1) * per_env]
+                el = original_labels[idx * per_env: (idx + 1) * per_env]
+                self.datasets.append(self._make_env(ei, el, angle, p))
+                env_names.append(f'rot={angle:.1f},p={p:.3f}')
+        self.ENVIRONMENTS = env_names
+
+        self.input_shape = (2, 28, 28,)
+        self.num_classes = 2
+
+    # ------------------------------------------------------------------
+    # Env construction: rotate first (on grayscale), then color
+    # ------------------------------------------------------------------
+    def _make_env(self, images, labels, angle, p_color):
+        # Rotate on the raw 1-channel images (uint8 tensor, shape [N, 28, 28])
+        rotated = self._rotate_images(images, angle)  # float [N, 28, 28], in [0,255]
+
+        # Apply the ColoredMNIST label-flipping + coloring pipeline
+        labels = (labels < 5).float()
+        labels = self._torch_xor(labels, self._torch_bernoulli(0.25, len(labels)))
+        colors = self._torch_xor(labels, self._torch_bernoulli(p_color, len(labels)))
+
+        # Stack into 2 channels, zero out the "off" channel per sample
+        imgs2 = torch.stack([rotated, rotated], dim=1)  # [N, 2, 28, 28]
+        imgs2[torch.arange(len(imgs2)), (1 - colors).long(), :, :] *= 0
+
+        x = imgs2.float().div_(255.0)
+        y = labels.view(-1).long()
+        return TensorDataset(x, y)
+
+    def _rotate_images(self, images, angle):
+        """Rotate a [N, 28, 28] uint8 tensor by `angle` degrees. Returns float
+        tensor [N, 28, 28] still in the [0, 255] range so the downstream
+        div_(255.0) in _make_env produces values in [0, 1]."""
+        if angle == 0.0:
+            return images.float()
+        rotation = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Lambda(lambda x: rotate(
+                x, angle, fill=(0,),
+                interpolation=torchvision.transforms.InterpolationMode.BILINEAR)),
+            transforms.ToTensor(),  # -> float in [0,1], shape [1, 28, 28]
+        ])
+        out = torch.zeros(len(images), 28, 28)
+        for k in range(len(images)):
+            out[k] = rotation(images[k]).squeeze(0) * 255.0
+        return out
+
+    def _torch_bernoulli(self, p, size):
+        return (torch.rand(size) < p).float()
+
+    def _torch_xor(self, a, b):
+        return (a - b).abs()
 
 
 class MultipleEnvironmentImageFolder(MultipleDomainDataset):
