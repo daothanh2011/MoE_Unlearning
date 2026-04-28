@@ -271,11 +271,7 @@ class ColoredMNIST_K(MultipleDomainDataset):
 
         self.input_shape = (2, 28, 28,)
         self.num_classes = 2
-        
-        # In your training script, right after the dataset is constructed:
-        print(f"len(dataset) = {len(dataset)}")
-        print(f"dataset.ENVIRONMENTS = {dataset.ENVIRONMENTS}")
-        print(f"hparams['num_source_domains'] = {hparams.get('num_source_domains')}")
+
 
     def color_dataset(self, images, labels, environment):
         labels = (labels < 5).float()
@@ -322,26 +318,29 @@ class RotatedMNIST(MultipleEnvironmentMNIST):
 
 
 class RotatedColoredMNIST_K(MultipleDomainDataset):
-    """Rotated + Colored MNIST grid: K = i*j envs from one hparam.
+    """Rotated + Colored MNIST: K envs laid out row-major in a 13x10 grid.
 
-    User specifies `num_source_domains` (= K, total env count). The class
-    decomposes K into:
-        i = ceil(K / 10)        # number of rotation values, in [1, 13]
-        j = K - (i - 1) * 10    # number of color values, in [1, 10]
-    so that color (j) fills up to 10 first, then rotation (i) increments.
+    User specifies `num_source_domains` (= K, total env count). Envs are
+    placed in a (rotation, color) grid in **row-major order**: each row
+    fills all 10 colors before moving to the next rotation. The final row
+    may be partial.
+
+    Layout for K = 10*r + s   (where r = K//10, s = K - 10*r):
+        - r FULL rows: rotations [0, 15, ..., 15*(r-1)],
+          each with all 10 colors [0.0, 0.1, ..., 0.9]
+        - 1 PARTIAL row (only if s > 0): rotation 15*r,
+          with the first s colors [0.0, 0.1, ..., 0.1*(s-1)]
 
     Examples:
-        K=3   -> i=1, j=3   (rotations [0],            colors [0.0, 0.1, 0.2])
-        K=10  -> i=1, j=10  (rotations [0],            colors [0.0..0.9])
-        K=11  -> i=2, j=1   (rotations [0, 15],        colors [0.0])
-        K=25  -> i=3, j=5   (rotations [0, 15, 30],    colors [0.0..0.4])
-        K=130 -> i=13, j=10 (max)
+        K=3   -> 1 partial row:  rot=0, colors [0.0, 0.1, 0.2]
+        K=10  -> 1 full row:     rot=0, colors [0.0..0.9]
+        K=11  -> 1 full + 1 partial: rot=0 (10 colors) + rot=15 (color 0.0)
+        K=25  -> 2 full + 1 partial: rot=0,15 (10 colors each) + rot=30 (5 colors)
+        K=130 -> 13 full rows (max)
 
-    Rotation angles: [0, 15, ..., 15*(i-1)] (15 deg step, max 180).
-    Color p values:  [0.0, 0.1, ..., 0.1*(j-1)] (0.1 step, in [0.0, 0.9]).
-
-    Env indexing: env (ri, ci) -> index ri * j + ci.
-        ri = 0..i-1 (rotation index), ci = 0..j-1 (color index)
+    Env at index `idx` has:
+        rot   = 15 * (idx // 10)
+        p     = 0.1 * (idx % 10)
 
     Sample budget: full MNIST (70000 samples) shuffled and split equally
     across the K envs. The user selects test env(s) externally via
@@ -360,10 +359,6 @@ class RotatedColoredMNIST_K(MultipleDomainDataset):
         if K < 1 or K > 130:
             raise ValueError(f"num_source_domains must be in [1, 130], got {K}")
 
-        # Decompose K into (i, j): fill color first (up to 10), then rotation.
-        i = (K - 1) // 10 + 1     # ceil(K / 10), in [1, 13]
-        j = K - (i - 1) * 10      # in [1, 10]
-
         # ---- Load full MNIST (train + test pooled) ----
         original_dataset_tr = MNIST(root, train=True, download=True)
         original_dataset_te = MNIST(root, train=False, download=True)
@@ -381,25 +376,22 @@ class RotatedColoredMNIST_K(MultipleDomainDataset):
         shuffle = torch.randperm(N_total)
         original_images = original_images[shuffle]
         original_labels = original_labels[shuffle]
-
-        # Trim to a multiple of K
         original_images = original_images[: K * per_env]
         original_labels = original_labels[: K * per_env]
 
-        # ---- Per-axis env params ----
-        rotation_angles = [15.0 * k for k in range(i)]   # length i
-        color_ps = [0.1 * k for k in range(j)]           # length j
-
-        # ---- Build envs: outer over rotation, inner over color ----
+        # ---- Build envs in row-major order ----
+        # idx -> (rot_idx = idx // 10, color_idx = idx % 10)
         env_names = []
         self.datasets = []
-        for ri, angle in enumerate(rotation_angles):
-            for ci, p in enumerate(color_ps):
-                idx = ri * j + ci
-                ei = original_images[idx * per_env: (idx + 1) * per_env]
-                el = original_labels[idx * per_env: (idx + 1) * per_env]
-                self.datasets.append(self._make_env(ei, el, angle, p))
-                env_names.append(f'rot={angle:.1f},p={p:.3f}')
+        for idx in range(K):
+            ri = idx // 10
+            ci = idx % 10
+            angle = 15.0 * ri
+            p = 0.1 * ci
+            ei = original_images[idx * per_env: (idx + 1) * per_env]
+            el = original_labels[idx * per_env: (idx + 1) * per_env]
+            self.datasets.append(self._make_env(ei, el, angle, p))
+            env_names.append(f'rot={angle:.1f},p={p:.3f}')
         self.ENVIRONMENTS = env_names
 
         self.input_shape = (2, 28, 28,)
