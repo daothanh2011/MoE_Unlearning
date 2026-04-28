@@ -317,35 +317,47 @@ class RotatedMNIST(MultipleEnvironmentMNIST):
 
 
 class RotatedColoredMNIST_K(MultipleDomainDataset):
-    """Rotated + Colored MNIST grid: i rotation angles x 10 color p values.
+    """Rotated + Colored MNIST grid: K = i*j envs from one hparam.
 
-    Builds a full grid of i*10 environments. The user selects which
-    environment(s) to hold out as test via the standard DomainBed
-    `test_envs` argument (handled externally; this class just exposes all
-    envs).
+    User specifies `num_source_domains` (= K, total env count). The class
+    decomposes K into:
+        i = ceil(K / 10)        # number of rotation values, in [1, 13]
+        j = K - (i - 1) * 10    # number of color values, in [1, 10]
+    so that color (j) fills up to 10 first, then rotation (i) increments.
 
-    Rotation angles: [0, 15, 30, ..., 15*(i-1)] (i angles, 15 deg step).
-      Constraint: 1 <= i <= 13 (so max angle is 15*12 = 180).
-    Color p values: [0.0, 0.1, 0.2, ..., 0.9] (always 10 values).
+    Examples:
+        K=3   -> i=1, j=3   (rotations [0],            colors [0.0, 0.1, 0.2])
+        K=10  -> i=1, j=10  (rotations [0],            colors [0.0..0.9])
+        K=11  -> i=2, j=1   (rotations [0, 15],        colors [0.0])
+        K=25  -> i=3, j=5   (rotations [0, 15, 30],    colors [0.0..0.4])
+        K=130 -> i=13, j=10 (max)
 
-    Env indexing: env (ri, ci) -> index ri * 10 + ci, where ri is the
-    rotation index (0..i-1) and ci is the color index (0..9).
+    Rotation angles: [0, 15, ..., 15*(i-1)] (15 deg step, max 180).
+    Color p values:  [0.0, 0.1, ..., 0.1*(j-1)] (0.1 step, in [0.0, 0.9]).
+
+    Env indexing: env (ri, ci) -> index ri * j + ci.
+        ri = 0..i-1 (rotation index), ci = 0..j-1 (color index)
 
     Sample budget: full MNIST (70000 samples) shuffled and split equally
-    across the i*10 envs (any remainder < i*10 is dropped).
+    across the K envs. The user selects test env(s) externally via
+    DomainBed's `test_envs` argument.
+
+    Constraint: 1 <= K <= 130.
     """
-    ENVIRONMENTS = [f'env_{k}' for k in range(130)]  # placeholder, overridden in __init__
+    ENVIRONMENTS = [f'env_{k}' for k in range(130)]  # placeholder
 
     def __init__(self, root, test_envs, hparams):
         super().__init__()
         if root is None:
             raise ValueError('Data directory not specified!')
 
-        i = int(hparams.get('num_rotation_domains', 3))
-        if i < 1 or i > 13:
-            raise ValueError(
-                f"num_rotation_domains must be in [1, 13], got {i}")
-        j = 10  # always 10 color p values: [0.0, 0.1, ..., 0.9]
+        K = int(hparams.get('num_source_domains', 9))
+        if K < 1 or K > 130:
+            raise ValueError(f"num_source_domains must be in [1, 130], got {K}")
+
+        # Decompose K into (i, j): fill color first (up to 10), then rotation.
+        i = (K - 1) // 10 + 1     # ceil(K / 10), in [1, 13]
+        j = K - (i - 1) * 10      # in [1, 10]
 
         # ---- Load full MNIST (train + test pooled) ----
         original_dataset_tr = MNIST(root, train=True, download=True)
@@ -356,27 +368,24 @@ class RotatedColoredMNIST_K(MultipleDomainDataset):
                                      original_dataset_te.targets))
 
         N_total = len(original_images)
-        n_envs = i * j  # i * 10
-        per_env = N_total // n_envs
+        per_env = N_total // K
         if per_env < 1:
             raise ValueError(
-                f"i*10={n_envs} too large for MNIST pool of {N_total} samples")
+                f"K={K} too large for MNIST pool of {N_total} samples")
 
         shuffle = torch.randperm(N_total)
         original_images = original_images[shuffle]
         original_labels = original_labels[shuffle]
 
-        # Trim to a multiple of n_envs
-        original_images = original_images[: n_envs * per_env]
-        original_labels = original_labels[: n_envs * per_env]
+        # Trim to a multiple of K
+        original_images = original_images[: K * per_env]
+        original_labels = original_labels[: K * per_env]
 
         # ---- Per-axis env params ----
-        # Rotation: i fixed 15-degree-step angles starting from 0
-        rotation_angles = [15.0 * k for k in range(i)]            # length i
-        # Color: 10 fixed p values starting from 0.0 with step 0.1
-        color_ps = [0.1 * k for k in range(j)]                    # length 10
+        rotation_angles = [15.0 * k for k in range(i)]   # length i
+        color_ps = [0.1 * k for k in range(j)]           # length j
 
-        # ---- Build all envs: outer over rotation, inner over color ----
+        # ---- Build envs: outer over rotation, inner over color ----
         env_names = []
         self.datasets = []
         for ri, angle in enumerate(rotation_angles):
@@ -395,15 +404,12 @@ class RotatedColoredMNIST_K(MultipleDomainDataset):
     # Env construction: rotate first (on grayscale), then color
     # ------------------------------------------------------------------
     def _make_env(self, images, labels, angle, p_color):
-        # Rotate on the raw 1-channel images (uint8 tensor, shape [N, 28, 28])
         rotated = self._rotate_images(images, angle)  # float [N, 28, 28], in [0,255]
 
-        # Apply the ColoredMNIST label-flipping + coloring pipeline
         labels = (labels < 5).float()
         labels = self._torch_xor(labels, self._torch_bernoulli(0.25, len(labels)))
         colors = self._torch_xor(labels, self._torch_bernoulli(p_color, len(labels)))
 
-        # Stack into 2 channels, zero out the "off" channel per sample
         imgs2 = torch.stack([rotated, rotated], dim=1)  # [N, 2, 28, 28]
         imgs2[torch.arange(len(imgs2)), (1 - colors).long(), :, :] *= 0
 
@@ -412,9 +418,9 @@ class RotatedColoredMNIST_K(MultipleDomainDataset):
         return TensorDataset(x, y)
 
     def _rotate_images(self, images, angle):
-        """Rotate a [N, 28, 28] uint8 tensor by `angle` degrees. Returns float
-        tensor [N, 28, 28] still in the [0, 255] range so the downstream
-        div_(255.0) in _make_env produces values in [0, 1]."""
+        """Rotate [N, 28, 28] uint8 tensor by `angle` degrees. Returns float
+        tensor [N, 28, 28] in [0, 255] range; downstream div_(255.0) in
+        _make_env produces values in [0, 1]."""
         if angle == 0.0:
             return images.float()
         rotation = transforms.Compose([
@@ -422,7 +428,7 @@ class RotatedColoredMNIST_K(MultipleDomainDataset):
             transforms.Lambda(lambda x: rotate(
                 x, angle, fill=(0,),
                 interpolation=torchvision.transforms.InterpolationMode.BILINEAR)),
-            transforms.ToTensor(),  # -> float in [0,1], shape [1, 28, 28]
+            transforms.ToTensor(),
         ])
         out = torch.zeros(len(images), 28, 28)
         for k in range(len(images)):
