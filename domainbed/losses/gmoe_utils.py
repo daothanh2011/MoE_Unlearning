@@ -237,6 +237,49 @@ def loss_balance(pi):
     return ((mean - 1.0 / M) ** 2).sum()
 
 
+class LoadBalanceLoss(nn.Module):
+    """
+    Load balancing loss with EMA over batch-averaged routing.
+
+        hat_pi^{(t)} = beta * hat_pi^{(t-1)} + (1 - beta) * mean_i pi(x_i)
+        L_bal        = sum_m (hat_pi_m - 1/M)^2
+
+    The EMA buffer is registered with register_buffer so it moves with
+    .cuda() / .to() and persists across training but is NOT trained.
+    The buffer itself is detached from the graph; only the current batch's
+    contribution carries gradient.
+    """
+    def __init__(self, num_experts, beta=0.99):
+        super().__init__()
+        self.num_experts = num_experts
+        self.beta = beta
+        # initialise EMA at uniform 1/M so the loss starts at 0
+        self.register_buffer('ema_pi', torch.full((num_experts,), 1.0 / num_experts))
+        self.register_buffer('initialised', torch.tensor(False))
+
+    def forward(self, pi):
+        M = pi.size(1)
+        batch_mean = pi.mean(dim=0)              # (M,) — keeps grad
+
+        if self.training:
+            # On the first call replace uniform init with the actual batch mean,
+            # so the EMA isn't anchored to a "perfect" value.
+            if not self.initialised:
+                self.ema_pi.copy_(batch_mean.detach())
+                self.initialised.fill_(True)
+            else:
+                self.ema_pi.mul_(self.beta).add_(
+                    batch_mean.detach(), alpha=1.0 - self.beta)
+
+        # Use a differentiable proxy: blend EMA (no-grad) with current batch (grad).
+        # As beta → 1 the gradient signal vanishes, so we mix in (1-beta) of the
+        # current batch to preserve a learning signal — same trick used in
+        # tutel/SwitchTransformer-style EMA balance losses.
+        hat_pi = self.beta * self.ema_pi + (1.0 - self.beta) * batch_mean
+
+        return ((hat_pi - 1.0 / M) ** 2).sum()
+
+
 def loss_diversity(h_stack):
     """
     Expert diversity — minimises cross-expert batch correlation.

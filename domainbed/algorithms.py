@@ -1249,6 +1249,11 @@ class GMoEVariantBase(nn.Module):
             weight_decay=hparams['weight_decay'],
         )
 
+        self.balance_loss_fn = LoadBalanceLoss(
+            num_experts=num_experts,
+            beta=hparams.get('balance_ema_beta', 0.99),
+        ).cuda()
+
         self._print_param_counts()
 
     def train(self, mode=True):
@@ -1518,7 +1523,8 @@ class GMOE_Full(GMoEVariantBase):
         l_cls = F.cross_entropy(logits, all_y)
         l_inv = self._compute_invariance(h_stack, pi, all_y, dom_id)
         l_sp  = loss_sparse(pi)
-        l_bal = loss_balance(pi)
+        # l_bal = loss_balance(pi)
+        l_bal = self.balance_loss_fn(pi)
         l_div = loss_diversity(h_stack)
 
         loss = (l_cls
