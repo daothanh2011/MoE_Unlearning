@@ -2,6 +2,7 @@
 
 import os
 import sys
+import itertools
 from itertools import chain
 
 import timm
@@ -9,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
+from torch.autograd import grad
 import torch.autograd as autograd
 from domainbed.lib.misc import (
     random_pairs_of_minibatches, ParamDict, MovingAverage, l2_between_dicts
@@ -71,9 +73,12 @@ ALGORITHMS = [
     'GMOE_InvMMD',
     'GMOE_InvOT',
     'GMOE_InvAdv',
-    'GMOE_InvED'
+    'GMOE_InvED',
+    
+    # Unlearn Wrapper
+    'ERM_Unlearn',
+    'GMOE_Full_Unlearn'
 ]
-
 
 def get_algorithm_class(algorithm_name):
     """Return the algorithm class with the given name."""
@@ -199,6 +204,193 @@ class ERM(Algorithm):
     def predict(self, x):
         return self.network(x)
 
+class ERM_Unlearn(Algorithm):
+    """
+    Unlearning class for ERM
+    """
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(ERM_Unlearn, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = networks.Classifier(
+            self.featurizer.n_outputs,
+            num_classes,
+            self.hparams['nonlinear_classifier'])
+
+        self.network = nn.Sequential(self.featurizer, self.classifier).cuda()
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+        self.num_classes = num_classes
+
+    def update_finetune(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        loss = F.cross_entropy(self.predict(all_x), all_y)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return {'loss': loss.item()}
+    
+    def update_ga(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        loss = F.cross_entropy(self.predict(all_x), all_y)
+
+        self.optimizer.zero_grad()
+        (-loss).backward()
+        self.optimizer.step()
+        return {'loss': loss.item()}
+
+    def update_rl(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+
+        shifts = torch.randint(
+            low=1, 
+            high=self.num_classes, 
+            size=all_y.shape, 
+            dtype=all_y.dtype, 
+            device=all_y.device
+        )
+        random_y = (all_y + shifts) % self.num_classes
+
+        loss = F.cross_entropy(self.predict(all_x), random_y)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return {'loss': loss.item()}
+
+    def update_boundary_shrink(self, minibatches, epsilon=0.1, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+
+        self.network.eval()
+
+        x_adv = all_x.detach().clone().requires_grad_(True)
+
+        adv_logits = self.predict(x_adv)
+        loss_adv = F.cross_entropy(adv_logits, all_y)
+
+        self.optimizer.zero_grad() 
+        loss_adv.backward()
+
+        grad_sign = x_adv.grad.detach().sign()
+        x_perturbed = x_adv.detach() + epsilon * grad_sign
+
+        with torch.no_grad():
+            perturbed_logits = self.predict(x_perturbed)
+            pred_label = torch.argmax(perturbed_logits, dim=1)
+        
+        self.network.train()
+        self.optimizer.zero_grad()
+
+        ori_logits = self.predict(all_x)
+        loss = F.cross_entropy(ori_logits, pred_label)
+        
+        loss.backward()
+        self.optimizer.step()
+        
+        return {'loss': loss.item()}
+
+    def update_wfisher(self, retain_loader, forget_loader, alpha=0.67, num_steps=1000):
+        device = next(self.network.parameters()).device
+        self.network.eval() 
+
+        params_list = [param.view(-1) for param in self.network.parameters()]
+        forget_grad = torch.zeros_like(torch.cat(params_list)).to(device)
+        retain_grad = torch.zeros_like(torch.cat(params_list)).to(device)
+
+        total_forget = 0
+        total_retain = 0
+
+        for data, label in itertools.islice(forget_loader, num_steps):
+            data, label = data.to(device), label.to(device)
+            self.optimizer.zero_grad()
+            output = self.predict(data)
+            loss = F.cross_entropy(output, label)
+            
+            sample_grad = grad(loss, self.network.parameters())
+            sample_grad = torch.cat([x.view(-1) for x in sample_grad])
+            
+            real_num = data.shape[0]
+            forget_grad += sample_grad * real_num
+            total_forget += real_num
+
+        for data, label in itertools.islice(retain_loader, num_steps):
+            data, label = data.to(device), label.to(device)
+            self.optimizer.zero_grad()
+            output = self.predict(data)
+            loss = F.cross_entropy(output, label)
+            
+            sample_grad = grad(loss, self.network.parameters())
+            sample_grad = torch.cat([x.view(-1) for x in sample_grad])
+            
+            real_num = data.shape[0]
+            retain_grad += sample_grad * real_num
+            total_retain += real_num
+
+        if total_forget > 0 and total_retain > 0:
+            retain_grad *= total_forget / ((total_forget + total_retain) * total_retain)
+            forget_grad /= (total_forget + total_retain)
+
+        v = forget_grad - retain_grad
+
+        k_vec = torch.clone(v)
+        o_vec = None
+        
+        for data, label in itertools.islice(retain_loader, num_steps):
+            self.optimizer.zero_grad()
+            data, label = data.to(device), label.to(device)
+            output = self.predict(data)
+            loss = F.cross_entropy(output, label)
+            
+            sample_grad = grad(loss, self.network.parameters())
+            sample_grad = torch.cat([x.view(-1) for x in sample_grad])
+            
+            with torch.no_grad():
+                if o_vec is None:
+                    o_vec = torch.clone(sample_grad)
+                else:
+                    tmp = torch.dot(o_vec, sample_grad)
+                    k_vec -= (torch.dot(k_vec, sample_grad) / (num_steps + tmp)) * o_vec
+                    o_vec -= (tmp / (num_steps + tmp)) * o_vec
+
+        perturb = k_vec
+
+        curr = 0
+        with torch.no_grad():
+            for param in self.network.parameters():
+                length = param.view(-1).shape[0]
+                param += (alpha * perturb[curr : curr + length]).view(param.shape)
+                curr += length
+
+        self.network.train()
+        self.optimizer.zero_grad()
+        return {'loss': 0.0}
+        
+    def update_l1_sparse(self, minibatches, alpha=0.25, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        ce_loss = F.cross_entropy(self.predict(all_x), all_y)
+
+        l1_penalty = 0.0
+        for name, param in self.network.named_parameters():
+            if 'weight' in name and 'bn' not in name:
+                l1_penalty += torch.sum(torch.abs(param))
+
+        total_loss = ce_loss + alpha * l1_penalty
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+        return {'loss': total_loss.item()}
+
+    def predict(self, x):
+        return self.network(x)
 
 class ERM_CIRL(ERM):
     """
@@ -1256,6 +1448,10 @@ class GMoEVariantBase(nn.Module):
 
         self._print_param_counts()
 
+    @property
+    def network(self):
+        return self
+
     def train(self, mode=True):
         """
         Override train() so a frozen backbone stays in eval mode even when
@@ -1568,6 +1764,176 @@ class GMOE_Full(GMoEVariantBase):
 # ---------------------------------------------------------------------------
 # GMOE_InvMMD — conditional MMD
 # ---------------------------------------------------------------------------
+
+class GMOE_Full_Unlearn(GMOE_Full):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(GMOE_Full_Unlearn, self).__init__(input_shape, num_classes, num_domains, hparams)
+
+    def update_finetune(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        loss = F.cross_entropy(self.predict(all_x), all_y)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return {'loss': loss.item()}
+    
+    def update_ga(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        loss = F.cross_entropy(self.predict(all_x), all_y)
+
+        self.optimizer.zero_grad()
+        (-loss).backward() 
+        self.optimizer.step()
+        return {'loss': loss.item()}
+
+    def update_rl(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+
+        shifts = torch.randint(
+            low=1, 
+            high=self.num_classes, 
+            size=all_y.shape, 
+            dtype=all_y.dtype, 
+            device=all_y.device
+        )
+        random_y = (all_y + shifts) % self.num_classes
+
+        loss = F.cross_entropy(self.predict(all_x), random_y)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return {'loss': loss.item()}
+
+    def update_boundary_shrink(self, minibatches, epsilon=0.1, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+
+        self.eval() 
+
+        x_adv = all_x.detach().clone().requires_grad_(True)
+
+        adv_logits = self.predict(x_adv)
+        loss_adv = F.cross_entropy(adv_logits, all_y)
+
+        self.optimizer.zero_grad() 
+        loss_adv.backward()
+
+        grad_sign = x_adv.grad.detach().sign()
+        x_perturbed = x_adv.detach() + epsilon * grad_sign
+
+        with torch.no_grad():
+            perturbed_logits = self.predict(x_perturbed)
+            pred_label = torch.argmax(perturbed_logits, dim=1)
+        
+        self.train() 
+        self.optimizer.zero_grad()
+
+        ori_logits = self.predict(all_x)
+        loss = F.cross_entropy(ori_logits, pred_label)
+        
+        loss.backward()
+        self.optimizer.step()
+        
+        return {'loss': loss.item()}
+
+    def update_wfisher(self, retain_loader, forget_loader, alpha=0.67, num_steps=1000):
+        device = next(self.parameters()).device
+        self.eval() 
+
+        params_list = [param.view(-1) for param in self.parameters()]
+        forget_grad = torch.zeros_like(torch.cat(params_list)).to(device)
+        retain_grad = torch.zeros_like(torch.cat(params_list)).to(device)
+
+        total_forget = 0
+        total_retain = 0
+
+        for data, label in itertools.islice(forget_loader, num_steps):
+            data, label = data.to(device), label.to(device)
+            self.optimizer.zero_grad()
+            output = self.predict(data)
+            loss = F.cross_entropy(output, label)
+            
+            sample_grad = grad(loss, self.parameters())
+            sample_grad = torch.cat([x.view(-1) for x in sample_grad])
+            
+            real_num = data.shape[0]
+            forget_grad += sample_grad * real_num
+            total_forget += real_num
+
+        for data, label in itertools.islice(retain_loader, num_steps):
+            data, label = data.to(device), label.to(device)
+            self.optimizer.zero_grad()
+            output = self.predict(data)
+            loss = F.cross_entropy(output, label)
+            
+            sample_grad = grad(loss, self.parameters())
+            sample_grad = torch.cat([x.view(-1) for x in sample_grad])
+            
+            real_num = data.shape[0]
+            retain_grad += sample_grad * real_num
+            total_retain += real_num
+
+        if total_forget > 0 and total_retain > 0:
+            retain_grad *= total_forget / ((total_forget + total_retain) * total_retain)
+            forget_grad /= (total_forget + total_retain)
+
+        v = forget_grad - retain_grad
+
+        k_vec = torch.clone(v)
+        o_vec = None
+        
+        for data, label in itertools.islice(retain_loader, num_steps):
+            self.optimizer.zero_grad()
+            data, label = data.to(device), label.to(device)
+            output = self.predict(data)
+            loss = F.cross_entropy(output, label)
+            
+            sample_grad = grad(loss, self.parameters())
+            sample_grad = torch.cat([x.view(-1) for x in sample_grad])
+            
+            with torch.no_grad():
+                if o_vec is None:
+                    o_vec = torch.clone(sample_grad)
+                else:
+                    tmp = torch.dot(o_vec, sample_grad)
+                    k_vec -= (torch.dot(k_vec, sample_grad) / (num_steps + tmp)) * o_vec
+                    o_vec -= (tmp / (num_steps + tmp)) * o_vec
+
+        perturb = k_vec
+
+        curr = 0
+        with torch.no_grad():
+            for param in self.parameters():
+                length = param.view(-1).shape[0]
+                param += (alpha * perturb[curr : curr + length]).view(param.shape)
+                curr += length
+
+        self.train()
+        self.optimizer.zero_grad()
+        return {'loss': 0.0}
+        
+    def update_l1_sparse(self, minibatches, alpha=1e-3, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        ce_loss = F.cross_entropy(self.predict(all_x), all_y)
+
+        l1_penalty = 0.0
+        for name, param in self.named_parameters():
+            if 'weight' in name and 'bn' not in name:
+                l1_penalty += torch.sum(torch.abs(param))
+
+        total_loss = ce_loss + alpha * l1_penalty
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+        return {'loss': total_loss.item()}
+
 
 class GMOE_InvMMD(GMoEVariantBase):
     """

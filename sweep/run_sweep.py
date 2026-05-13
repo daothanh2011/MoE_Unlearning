@@ -56,8 +56,6 @@ _MODEL_TAG = {
     "deit_base_patch16_224":  "B",
 }
 
-
-
 def make_run_id(dataset, num_experts, top_k, expert_prune_ratio, mlp_ratio, expert_depth, test_env,
                 model="deit_small_patch16_224", use_omoe=False, use_balance_loss=False):
     pr_int    = int(round(expert_prune_ratio * 10))
