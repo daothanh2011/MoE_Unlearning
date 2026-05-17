@@ -498,13 +498,128 @@ class VLCS(MultipleEnvironmentImageFolder):
         super().__init__(self.dir, test_envs, hparams['data_augmentation'], hparams)
 
 
+class _PACSArrowEnv(torch.utils.data.Dataset):
+    """A single PACS domain backed by a HuggingFace Arrow file.
+
+    Exposes ``classes`` so callers that compute ``num_classes`` via
+    ``len(env.classes)`` (as ``MultipleEnvironmentImageFolder`` does) keep
+    working unchanged.
+    """
+
+    def __init__(self, hf_dataset, indices, classes, transform):
+        self.hf_dataset = hf_dataset
+        self.indices = indices
+        self.classes = classes
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        row = self.hf_dataset[int(self.indices[idx])]
+        img = row["image"]
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, int(row["label"])
+
+
 class PACS(MultipleEnvironmentImageFolder):
     CHECKPOINT_FREQ = 300
     ENVIRONMENTS = ["A", "C", "P", "S"]
+    # Maps the canonical ENVIRONMENTS letters to the `domain` string used
+    # by the flwrlabs/pacs HuggingFace dataset. Index order here must match
+    # ENVIRONMENTS so that ``test_envs`` indices stay consistent across
+    # ImageFolder- and Arrow-backed instantiations.
+    _HF_DOMAIN_ORDER = ["art_painting", "cartoon", "photo", "sketch"]
 
     def __init__(self, root, test_envs, hparams):
         self.dir = os.path.join(root, "PACS/")
-        super().__init__(self.dir, test_envs, hparams['data_augmentation'], hparams)
+        arrow_path = os.path.join(self.dir, "pacs-train.arrow")
+        if os.path.isfile(arrow_path):
+            MultipleDomainDataset.__init__(self)
+            self._init_from_arrow(
+                arrow_path, test_envs, hparams.get("data_augmentation", True))
+        else:
+            super().__init__(self.dir, test_envs,
+                             hparams['data_augmentation'], hparams)
+
+    @staticmethod
+    def _import_hf_dataset():
+        """Import HuggingFace ``datasets.Dataset`` despite sys.path shadowing.
+
+        Other modules in this repo (notably ``domainbed/algorithms.py``)
+        prepend the ``domainbed/`` directory to ``sys.path`` so that
+        ``import vision_transformer`` works as a top-level name. That makes
+        a plain ``from datasets import Dataset`` resolve to this very file
+        (``domainbed/datasets.py``) instead of the installed HuggingFace
+        package. We temporarily strip any sys.path entry pointing at this
+        file's directory, and clear a possibly-poisoned ``sys.modules``
+        entry, then perform the import.
+        """
+        import sys
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        saved_path = sys.path[:]
+        saved_mod = sys.modules.pop('datasets', None)
+        sys.path = [p for p in sys.path
+                    if not p or os.path.abspath(p) != this_dir]
+        try:
+            from datasets import Dataset as HFDataset  # type: ignore
+            return HFDataset
+        except ImportError as e:
+            raise ImportError(
+                "Loading PACS from an Arrow file requires the `datasets` "
+                "package. Install it with `pip install datasets`."
+            ) from e
+        finally:
+            sys.path = saved_path
+            # Only restore the previous binding if it was a real, distinct
+            # module (i.e. not a stale reference to this file).
+            if saved_mod is not None and getattr(
+                    saved_mod, '__file__', None) != os.path.abspath(__file__):
+                sys.modules['datasets'] = saved_mod
+
+    def _init_from_arrow(self, arrow_path, test_envs, augment):
+        HFDataset = self._import_hf_dataset()
+
+        hf = HFDataset.from_file(arrow_path)
+        required = {"image", "domain", "label"}
+        if not required.issubset(hf.features.keys()):
+            raise ValueError(
+                f"Unexpected schema in {arrow_path}; expected "
+                f"image/domain/label, got {list(hf.features.keys())}")
+        label_names = list(hf.features["label"].names)
+
+        env_indices = {d: [] for d in self._HF_DOMAIN_ORDER}
+        for i, d in enumerate(hf["domain"]):
+            if d in env_indices:
+                env_indices[d].append(i)
+
+        normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        base_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            normalize,
+        ])
+        augment_transform = transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(0.3, 0.3, 0.3, 0.3),
+            transforms.RandomGrayscale(p=0.1),
+            transforms.ToTensor(),
+            normalize,
+        ])
+
+        self.datasets = []
+        for i, domain in enumerate(self._HF_DOMAIN_ORDER):
+            env_t = augment_transform if (augment and i not in test_envs) else base_transform
+            self.datasets.append(
+                _PACSArrowEnv(hf, env_indices[domain], label_names, env_t))
+
+        self.input_shape = (3, 224, 224,)
+        self.num_classes = len(label_names)
 
 
 class DomainNet(MultipleEnvironmentImageFolder):

@@ -15,6 +15,18 @@ from domainbed import vision_transformer as vit_module
 # Explicit MoE head
 # ---------------------------------------------------------------------------
 
+def _make_expert_mlp(in_dim, expert_dim, expert_depth):
+    """Stack of linear–GELU blocks mapping z → expert_dim (expert_depth ≥ 2)."""
+    if expert_depth < 2:
+        raise ValueError('expert_depth must be >= 2')
+    layers = []
+    layers += [nn.Linear(in_dim, expert_dim), nn.GELU()]
+    for _ in range(expert_depth - 2):
+        layers += [nn.Linear(expert_dim, expert_dim), nn.GELU()]
+    layers += [nn.Linear(expert_dim, expert_dim)]
+    return nn.Sequential(*layers)
+
+
 class ExplicitMoEHead(nn.Module):
     """
     Implements:
@@ -26,26 +38,40 @@ class ExplicitMoEHead(nn.Module):
     Returns per-expert outputs h_m and routing weights pi so that the
     variant-specific loss functions can operate on them.
     """
-    def __init__(self, in_dim, expert_dim, num_experts, num_classes):
+    def __init__(
+        self,
+        in_dim,
+        expert_dim,
+        num_experts,
+        num_classes,
+        mlp_ratio=4.0,
+        prune_ratio=0.0,
+        expert_depth=2,
+        **kwargs,
+    ):
         super().__init__()
         self.num_experts = num_experts
-        self.expert_dim  = expert_dim
+        self.expert_dim = expert_dim
+        self.expert_depth = expert_depth
+        # mlp_ratio / prune_ratio accepted for sweep compatibility; dense head ignores them.
 
-        # M expert MLPs: each z → r
         self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(in_dim, expert_dim),
-                nn.GELU(),
-                nn.Linear(expert_dim, expert_dim),
-            )
+            _make_expert_mlp(in_dim, expert_dim, expert_depth)
             for _ in range(num_experts)
         ])
 
         # Soft routing network: z → (M,)
         self.router = nn.Linear(in_dim, num_experts, bias=True)
+        self.router_temperature = float(kwargs.get('router_temperature', 1.0))
+        self._init_router_near_uniform()
 
         # Final classifier: r → num_classes
         self.classifier = nn.Linear(expert_dim, num_classes)
+
+    def _init_router_near_uniform(self):
+        """Start from ~uniform routing so L_bal / CE can spread load before L_sp peaks."""
+        nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.router.bias)
 
     def forward(self, z):
         """
@@ -59,7 +85,8 @@ class ExplicitMoEHead(nn.Module):
         h_list  = [E(z) for E in self.experts]     # M × (B, r)
         h_stack = torch.stack(h_list, dim=1)        # (B, M, r)
 
-        pi = F.softmax(self.router(z), dim=-1)      # (B, M)
+        tau = max(float(self.router_temperature), 1e-6)
+        pi = F.softmax(self.router(z) / tau, dim=-1)   # (B, M)
         h  = (pi.unsqueeze(-1) * h_stack).sum(dim=1)  # (B, r)
 
         logits = self.classifier(h)
@@ -237,6 +264,21 @@ def loss_balance(pi):
     return ((mean - 1.0 / M) ** 2).sum()
 
 
+def loss_switch_balance(pi):
+    """
+    Switch-style auxiliary load balancing (gradient through router probs).
+
+        L = M * sum_i  f_i * P_i
+    with P_i = E[pi_i],  f_i = fraction of samples with argmax(pi) = i.
+    Uniform routing gives L = 1; single-expert collapse gives L = M.
+    """
+    B, M = pi.shape
+    P = pi.mean(dim=0)
+    top1 = F.one_hot(pi.argmax(dim=-1), num_classes=M).float()
+    f = top1.mean(dim=0)
+    return M * (f * P).sum()
+
+
 class LoadBalanceLoss(nn.Module):
     """
     Load balancing loss with EMA over batch-averaged routing.
@@ -280,23 +322,41 @@ class LoadBalanceLoss(nn.Module):
         return ((hat_pi - 1.0 / M) ** 2).sum()
 
 
-def loss_diversity(h_stack):
+def loss_diversity(h_stack, fro_normalize=False, eps=1e-6, normalize_by_pairs=False):
     """
     Expert diversity — minimises cross-expert batch correlation.
 
-    L_div = sum_{m != n} || (1/B) H_m^T H_n ||_F^2
+    Default (fro_normalize=False):
+        L_div = sum_{m != n} || (1/B) H_m^T H_n ||_F^2
+
+    With fro_normalize=True (modular-learning paper):
+        tilde H_m = H_m / max(||H_m||_F, eps),  then same sum on tilde H.
 
     Args:
         h_stack: (B, M, r)
+        fro_normalize: per-expert Frobenius norm on the (B, r) expert output matrix
+        eps: numerical stability for Frobenius normalization
+        normalize_by_pairs: divide by M*(M-1) so scale is stable across expert counts
     """
     B, M, r = h_stack.shape
+    if M < 2:
+        return h_stack.new_zeros(())
     loss = h_stack.new_zeros(1).squeeze()
+    h_used = []
+    for m in range(M):
+        Hm = h_stack[:, m, :]
+        if fro_normalize:
+            denom = Hm.norm(p='fro').clamp(min=eps)
+            Hm = Hm / denom
+        h_used.append(Hm)
     for m in range(M):
         for n in range(M):
             if m == n:
                 continue
-            C = (h_stack[:, m, :].T @ h_stack[:, n, :]) / B   # (r, r)
+            C = (h_used[m].T @ h_used[n]) / B   # (r, r)
             loss = loss + (C ** 2).sum()
+    if normalize_by_pairs:
+        loss = loss / max(M * (M - 1), 1)
     return loss
 
 

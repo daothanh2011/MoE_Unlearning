@@ -183,7 +183,13 @@ def _hparams(algorithm, dataset, random_seed):
     elif algorithm in ['DANN', 'CDANN']:
         _hparam('weight_decay_g', 0., lambda r: 10 ** r.uniform(-6, -2))
 
-    if algorithm in ('GMOE', 'GMoEOMoE'):
+    if algorithm in (
+        'GMOE',
+        'GMoEOMoE',
+        'GMOE_Full',
+        'GMOE_ModularLearn',
+        'GMOE_Full_Unlearn',
+    ):
         _hparam('num_experts',        6,                        lambda r: 6)
         _hparam('gate_k',             1,                        lambda r: 1)
         _hparam('mlp_ratio',          4.0,                      lambda r: 4.0)
@@ -228,6 +234,14 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('variance_loss_weight', 0.0, lambda r: r.choice([0., 1e-4, 1e-3]))
         _hparam('moe_top_k',            1,   lambda r: r.choice([1, 2]))
         _hparam('num_experts',          6,   lambda r: r.choice([6, 8, 12, 16]))
+        # Modular learning (paper L_learn auxiliaries)
+        _hparam('lambda_sp',            0.01, lambda r: 0.01)
+        _hparam('lambda_bal',           0.01, lambda r: 0.01)
+        _hparam('lambda_div',           0.01, lambda r: 0.01)
+        _hparam('div_fro_normalize',      False, lambda r: False)
+        _hparam('use_batch_balance_loss', False, lambda r: False)
+        _hparam('router_temperature',     1.0, lambda r: 1.0)
+        _hparam('balance_loss_type',      'mse', lambda r: 'mse')
 
     return hparams
 

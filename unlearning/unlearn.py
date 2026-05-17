@@ -56,6 +56,12 @@ class ApplyTransform(Dataset):
     def __len__(self):
         return len(self.subset)
 
+
+def _mia_in_stop_band(mia_score, low, high):
+    """True if loss-based MIA attack accuracy is in [low, high] (chance = 0.5)."""
+    return low <= mia_score <= high
+
+
 if __name__ == "__main__":
     WANDB_PROJECT = "sparse_moe_unlearn"
 
@@ -64,7 +70,31 @@ if __name__ == "__main__":
     parser.add_argument('--debug', default="True")
     
     parser.add_argument('--unlearn_algo', type=str, default='finetune',
-                        choices=['finetune', 'ga', 'rl', 'boundary_shrink', 'wfisher', 'l1_sparse'])
+                        choices=['finetune', 'ga', 'rl', 'boundary_shrink', 'wfisher', 'l1_sparse',
+                                 'modular'])
+    parser.add_argument('--modular_unlearn_topk', type=int, default=None,
+                        help='Top-k experts by mean routing on forget set (modular unlearn).')
+    parser.add_argument('--modular_unlearn_tau', type=float, default=None,
+                        help='If set, select experts with s_m > tau instead of top-k.')
+    parser.add_argument('--modular_unlearn_beta', type=float, default=None,
+                        help='Weight on retain CE in modular unlearn (default 1.0).')
+    parser.add_argument('--modular_unlearn_gamma', type=float, default=None,
+                        help='Weight on KL distillation in modular unlearn (default 1.0).')
+    parser.add_argument('--modular_score_max_batches', type=int, default=None,
+                        help='Max batches when averaging routing over forget data (default 200).')
+    parser.add_argument('--modular_unlearn_lr', type=float, default=None,
+                        help='LR for modular phase (default: hparams lr).')
+    parser.add_argument('--modular_unlearn_use_modular_reg', action='store_true',
+                        help='Add optional L_div on selected experts during unlearn (default off).')
+    parser.add_argument('--modular_unlearn_lambda_div', type=float, default=None,
+                        help='λ_div for optional unlearn decorrelation (default 0; try 0.01 if --modular_unlearn_use_modular_reg).')
+
+    parser.add_argument('--no_mia_early_stop', action='store_true',
+                        help='Disable stopping when MIA is in the target band.')
+    parser.add_argument('--mia_stop_low', type=float, default=0.48,
+                        help='Lower bound of MIA attack accuracy for early stop (default 0.48).')
+    parser.add_argument('--mia_stop_high', type=float, default=0.52,
+                        help='Upper bound of MIA attack accuracy for early stop (default 0.52).')
     
     parser.add_argument('--unlearn_setting', default='random', choices=['random', 'class'])
     parser.add_argument('--unlearn_random_ratio', default=None) # 0.1
@@ -128,6 +158,24 @@ if __name__ == "__main__":
     if args.hparams:
         hparams.update(json.loads(args.hparams))
 
+    if args.unlearn_algo == 'modular':
+        if args.modular_unlearn_topk is not None:
+            hparams['modular_unlearn_topk'] = args.modular_unlearn_topk
+        if args.modular_unlearn_tau is not None:
+            hparams['modular_unlearn_tau'] = args.modular_unlearn_tau
+        if args.modular_unlearn_beta is not None:
+            hparams['modular_unlearn_beta'] = args.modular_unlearn_beta
+        if args.modular_unlearn_gamma is not None:
+            hparams['modular_unlearn_gamma'] = args.modular_unlearn_gamma
+        if args.modular_score_max_batches is not None:
+            hparams['modular_score_max_batches'] = args.modular_score_max_batches
+        if args.modular_unlearn_lr is not None:
+            hparams['modular_unlearn_lr'] = args.modular_unlearn_lr
+        if args.modular_unlearn_use_modular_reg:
+            hparams['modular_unlearn_use_modular_reg'] = True
+        if args.modular_unlearn_lambda_div is not None:
+            hparams['modular_unlearn_lambda_div'] = args.modular_unlearn_lambda_div
+
     if args.batch_size is not None:
         hparams['batch_size'] = args.batch_size
     if args.drop_out is not None:
@@ -155,7 +203,7 @@ if __name__ == "__main__":
         raise NotImplementedError
 
     if not (args.debug == "True"):
-        wandb.login(key="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")
+        # wandb.login(key="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")
 
         _NEVER_SHOW = {
             'data_augmentation', 'resnet18', 'resnet_dropout',
@@ -170,20 +218,20 @@ if __name__ == "__main__":
         if len(run_name) > 128:
             run_name = run_name[:125] + '...'
 
-        wandb.init(
-            project=WANDB_PROJECT,
-            name=run_name,
-            config={
-                'dataset': args.dataset,
-                'algorithm': args.algorithm,
-                'unlearn_algo': args.unlearn_algo,
-                'seed': args.seed,
-                'trial_seed': args.trial_seed,
-                'hparams_seed': args.hparams_seed,
-                **{f'hp/{k}': hparams[k] for k in sorted(relevant_keys)},
-            },
-            settings=wandb.Settings(start_method='thread'),
-        )
+        # wandb.init(
+        #     project=WANDB_PROJECT,
+        #     name=run_name,
+        #     config={
+        #         'dataset': args.dataset,
+        #         'algorithm': args.algorithm,
+        #         'unlearn_algo': args.unlearn_algo,
+        #         'seed': args.seed,
+        #         'trial_seed': args.trial_seed,
+        #         'hparams_seed': args.hparams_seed,
+        #         **{f'hp/{k}': hparams[k] for k in sorted(relevant_keys)},
+        #     },
+        #     settings=wandb.Settings(start_method='thread'),
+        # )
 
     # deterministic split
     full_dataset = ConcatDataset([env for env in dataset])
@@ -323,12 +371,93 @@ if __name__ == "__main__":
         misc.print_row(results_keys, colwidth=12)
         misc.print_row([results[key] for key in results_keys], colwidth=12)
 
-        if wandb.run: wandb.log(results)
+        # if wandb.run: wandb.log(results)
         with open(os.path.join(args.output_dir, 'results.jsonl'), 'a') as f:
             f.write(json.dumps(results, sort_keys=True) + "\n")
             
         save_checkpoint('model_unlearned.pt')
-        
+
+    elif args.unlearn_algo == 'modular':
+        if not hasattr(algorithm, 'begin_modular_unlearn'):
+            raise NotImplementedError(
+                'modular unlearning requires GMOE_Full_Unlearn (explicit MoE head + routing).')
+
+        steps_per_epoch = max(1, int(len(retain_set_train) / hparams['batch_size']))
+        eval_interval = (args.num_step_per_evaluate
+                         if args.num_step_per_evaluate is not None
+                         else steps_per_epoch)
+
+        sel_info = algorithm.begin_modular_unlearn(forget_train_loader, device)
+        print(f"[*] Modular unlearn — selected experts {sel_info['expert_indices']}")
+        print(f"[*] Mean routing scores on forget (per expert): {sel_info['scores']}")
+        if not args.no_mia_early_stop:
+            print(f"[*] MIA early stop band: [{args.mia_stop_low}, {args.mia_stop_high}] "
+                  f"(attack accuracy ~0.5 = indistinguishable forget vs unseen loss)")
+
+        forget_iterator = iter(forget_train_loader)
+        retain_iterator = iter(retain_train_loader)
+
+        try:
+            for step in range(start_step, n_steps):
+                step_start_time = time.time()
+
+                xf, yf = next(forget_iterator)
+                xr, yr = next(retain_iterator)
+                forget_mb = [(xf.to(device), yf.to(device))]
+                retain_mb = [(xr.to(device), yr.to(device))]
+
+                step_vals = algorithm.update_modular_unlearn(forget_mb, retain_mb)
+
+                checkpoint_vals['step_time'].append(time.time() - step_start_time)
+                for key, val in step_vals.items():
+                    checkpoint_vals[key].append(val)
+
+                if (step > 0 and step % eval_interval == 0) or (step == n_steps - 1):
+                    current_epoch = step // steps_per_epoch
+                    results = {'step': step, 'epoch': current_epoch}
+
+                    for key, val in checkpoint_vals.items():
+                        results[key] = np.mean(val)
+
+                    results['test_acc'] = metrics.test_acc(algorithm, test_loader, device)
+                    results['retain_acc'] = metrics.retain_acc(algorithm, retain_test_loader, device)
+                    results['forget_acc'] = metrics.forget_acc(algorithm, forget_test_loader, device)
+                    results['mia_score'] = metrics.mia(algorithm, forget_test_loader, unseen_loader, device)
+
+                    results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024. * 1024. * 1024.)
+                    results['step_time'] = time.time() - step_start_time
+
+                    results_keys = sorted(results.keys())
+                    if results_keys != last_results_keys:
+                        misc.print_row(results_keys, colwidth=12)
+                        last_results_keys = results_keys
+                    misc.print_row([results[key] for key in results_keys], colwidth=12)
+
+                    # if wandb.run:
+                    #     wandb.log(results)
+
+                    epochs_path = os.path.join(args.output_dir, 'results.jsonl')
+                    with open(epochs_path, 'a') as f:
+                        f.write(json.dumps(results, sort_keys=True) + "\n")
+
+                    checkpoint_vals = collections.defaultdict(lambda: [])
+
+                    if args.save_model_every_checkpoint:
+                        save_checkpoint(f'model_epoch{current_epoch}.pt')
+
+                    current_mia = results['mia_score']
+
+                    if (not args.no_mia_early_stop
+                            and _mia_in_stop_band(
+                                current_mia, args.mia_stop_low, args.mia_stop_high)):
+                        print(f"\n[!] Early stopping triggered at step {step}!")
+                        print(f"[*] Target MIA in [{args.mia_stop_low}, {args.mia_stop_high}]: {current_mia}")
+                        break
+        finally:
+            algorithm.end_modular_unlearn()
+
+        save_checkpoint('model_unlearned_final.pt')
+
     else:
         if args.unlearn_algo in ['finetune', 'l1_sparse']:
             active_iterator = iter(retain_train_loader)
@@ -337,15 +466,17 @@ if __name__ == "__main__":
             active_iterator = iter(forget_train_loader)
             active_train_set = forget_set_train
         steps_per_epoch = max(1, int(len(active_train_set) / hparams['batch_size']))
-            
-        eval_interval = args.num_step_per_evaluate 
+
+        eval_interval = (args.num_step_per_evaluate
+                         if args.num_step_per_evaluate is not None
+                         else steps_per_epoch)
 
         for step in range(start_step, n_steps):
             step_start_time = time.time()
-            
+
             x, y = next(active_iterator)
             minibatches_device = [(x.to(device), y.to(device))]
-            
+
             if args.unlearn_algo == 'finetune':
                 step_vals = algorithm.update_finetune(minibatches_device)
             elif args.unlearn_algo == 'ga':
@@ -364,7 +495,7 @@ if __name__ == "__main__":
             if (step > 0 and step % eval_interval == 0) or (step == n_steps - 1):
                 current_epoch = step // steps_per_epoch
                 results = {'step': step, 'epoch': current_epoch}
-                
+
                 for key, val in checkpoint_vals.items():
                     results[key] = np.mean(val)
 
@@ -382,24 +513,26 @@ if __name__ == "__main__":
                     last_results_keys = results_keys
                 misc.print_row([results[key] for key in results_keys], colwidth=12)
 
-                if wandb.run:
-                    wandb.log(results)
+                # if wandb.run:
+                #     wandb.log(results)
 
                 epochs_path = os.path.join(args.output_dir, 'results.jsonl')
                 with open(epochs_path, 'a') as f:
                     f.write(json.dumps(results, sort_keys=True) + "\n")
 
                 checkpoint_vals = collections.defaultdict(lambda: [])
-                
+
                 if args.save_model_every_checkpoint:
                     save_checkpoint(f'model_epoch{current_epoch}.pt')
 
                 current_mia = results['mia_score']
-                
-                if (0.50 <= current_mia <= 0.51):
+
+                if (not args.no_mia_early_stop
+                        and _mia_in_stop_band(
+                            current_mia, args.mia_stop_low, args.mia_stop_high)):
                     print(f"\n[!] Early stopping triggered at step {step}!")
-                    print(f"[*] Target MIA achieved: {current_mia}")
-                    break 
+                    print(f"[*] Target MIA in [{args.mia_stop_low}, {args.mia_stop_high}]: {current_mia}")
+                    break
 
         save_checkpoint('model_unlearned_final.pt')
 

@@ -145,7 +145,10 @@ def print_row(row, colwidth=10, latex=False):
 
     def format_val(x):
         if np.issubdtype(type(x), np.floating):
-            x = "{:.4f}".format(x)
+            if x != 0.0 and abs(x) < 1e-3:
+                x = "{:.2e}".format(x)
+            else:
+                x = "{:.4f}".format(x)
         return str(x).ljust(colwidth)[:colwidth]
 
     print(sep.join([format_val(x) for x in row]), end_)

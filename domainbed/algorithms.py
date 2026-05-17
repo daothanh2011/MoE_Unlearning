@@ -35,6 +35,12 @@ from domainbed.losses.moe_specialization_losses import OrthoLoss, VarianceLoss
 from domainbed.losses.matchdg_utils import *
 from domainbed.losses.gmoe_utils import *
 from domainbed.deit_transformer import *
+# `deit_transformer` duplicates several GMoE losses without paper options;
+# re-bind from gmoe_utils after the star import.
+from domainbed.losses.gmoe_utils import (
+    ExplicitMoEHead,
+    loss_diversity, loss_sparse, loss_balance, loss_switch_balance,
+)
 
 
 ALGORITHMS = [
@@ -70,6 +76,7 @@ ALGORITHMS = [
     'GMOE_InvA',
     'GMOE_InvB',
     'GMOE_Full',
+    'GMOE_ModularLearn',
     'GMOE_InvMMD',
     'GMOE_InvOT',
     'GMOE_InvAdv',
@@ -1386,6 +1393,12 @@ class GMoEVariantBase(nn.Module):
         self.num_classes = num_classes
         self.num_domains = num_domains
 
+        # Common JSON typos for div_fro_normalize
+        if hparams.get('motion_fro_normalize') is not None:
+            hparams.setdefault('div_fro_normalize', hparams['motion_fro_normalize'])
+        if hparams.get('fro_normalize') is not None:
+            hparams.setdefault('div_fro_normalize', hparams['fro_normalize'])
+
         # ---- Architecture hparams (matches original GMOE / GMoEOMoE names) ----
         num_experts  = hparams.get('num_experts',        self.NUM_EXPERTS)
         gate_k       = hparams.get('gate_k',             1)
@@ -1433,6 +1446,7 @@ class GMoEVariantBase(nn.Module):
             mlp_ratio=mlp_ratio,
             prune_ratio=prune_ratio,
             expert_depth=expert_depth,
+            router_temperature=hparams.get('router_temperature', 1.0),
         ).cuda()
 
         self.optimizer = torch.optim.Adam(
@@ -1688,6 +1702,35 @@ class GMOE_Full(GMoEVariantBase):
         self.epsilon        = hparams.get('ot_epsilon',     0.1)
         self.sinkhorn_iters = hparams.get('sinkhorn_iters', 50)
 
+        # Modular-learning paper options (also used by GMOE_Full when set):
+        #   div_fro_normalize: L_div with per-expert Frobenius-normalized H_m
+        #   use_batch_balance_loss: L_bal = sum_m (mean_batch pi_m - 1/M)^2 (else EMA balance)
+        self.div_fro_normalize = hparams.get('div_fro_normalize', False)
+        self.use_batch_balance_loss = hparams.get('use_batch_balance_loss', False)
+        self.balance_loss_type = hparams.get('balance_loss_type', 'mse')
+
+    def _modular_balance_loss(self, pi):
+        """L_bal: batch MSE to uniform, optional Switch-style aux, or both."""
+        mode = getattr(self, 'balance_loss_type', 'mse')
+        if mode == 'switch':
+            return loss_switch_balance(pi)
+        if mode == 'mse_switch':
+            l_mse = (loss_balance(pi) if self.use_batch_balance_loss
+                     else self.balance_loss_fn(pi))
+            return l_mse + loss_switch_balance(pi)
+        return (loss_balance(pi) if self.use_batch_balance_loss
+                else self.balance_loss_fn(pi))
+
+    def _modular_learn_aux_loss(self, pi, h_stack):
+        """
+        Paper L_learn auxiliaries: L_sp (routing entropy), L_bal (load balance),
+        L_div (Frobenius-normalized cross-expert decorrelation when enabled).
+        """
+        l_sp = loss_sparse(pi)
+        l_bal = self._modular_balance_loss(pi)
+        l_div = loss_diversity(h_stack, fro_normalize=self.div_fro_normalize)
+        return l_sp, l_bal, l_div
+
     def _compute_invariance(self, h_stack, pi, all_y, dom_id):
         """Dispatch to the selected invariance loss."""
         C, D = self.num_classes, self.num_domains
@@ -1718,10 +1761,7 @@ class GMOE_Full(GMoEVariantBase):
 
         l_cls = F.cross_entropy(logits, all_y)
         l_inv = self._compute_invariance(h_stack, pi, all_y, dom_id)
-        l_sp  = loss_sparse(pi)
-        # l_bal = loss_balance(pi)
-        l_bal = self.balance_loss_fn(pi)
-        l_div = loss_diversity(h_stack)
+        l_sp, l_bal, l_div = self._modular_learn_aux_loss(pi, h_stack)
 
         loss = (l_cls
                 + self.lambda_inv * l_inv
@@ -1737,6 +1777,59 @@ class GMOE_Full(GMoEVariantBase):
             'loss':     loss.item(),
             'loss_cls': l_cls.item(),
             'loss_inv': l_inv.item(),
+            'loss_sp':  l_sp.item(),
+            'loss_bal': l_bal.item(),
+            'loss_div': l_div.item(),
+        }
+
+
+class GMOE_ModularLearn(GMOE_Full):
+    """
+    Modular learning stage (paper): only task + routing + specialization — no L_inv.
+
+        L_learn = L_task + λ_sp L_sp + λ_bal L_bal + λ_div L_div
+
+    Defaults favour balanced routing (λ_bal > λ_sp, router_temperature > 1,
+    balance_loss_type=mse_switch). Set ``div_fro_normalize`` / ``use_batch_balance_loss``
+    in hparams for the paper's batch balance and Frobenius-normalized diversity.
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(GMOE_ModularLearn, self).__init__(
+            input_shape, num_classes, num_domains, hparams)
+        self.lambda_sp = hparams.get('lambda_sp', 0.001)
+        self.lambda_bal = hparams.get('lambda_bal', 0.1)
+        self.lambda_div = hparams.get('lambda_div', 0.01)
+        self.balance_loss_type = hparams.get('balance_loss_type', 'mse_switch')
+        self.use_batch_balance_loss = hparams.get('use_batch_balance_loss', True)
+        self.div_fro_normalize = hparams.get('div_fro_normalize', True)
+        tau = hparams.get('router_temperature', 2.0)
+        self.moe_head.router_temperature = tau
+        print(f'[GMOE_ModularLearn] λ_sp={self.lambda_sp} λ_bal={self.lambda_bal} '
+              f'λ_div={self.lambda_div} balance={self.balance_loss_type} '
+              f'router_temperature={tau} div_fro_normalize={self.div_fro_normalize}')
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+
+        logits, pi, h_stack = self._forward(all_x)
+
+        l_cls = F.cross_entropy(logits, all_y)
+        l_sp, l_bal, l_div = self._modular_learn_aux_loss(pi, h_stack)
+
+        loss = (l_cls
+                + self.lambda_sp * l_sp
+                + self.lambda_bal * l_bal
+                + self.lambda_div * l_div)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {
+            'loss':     loss.item(),
+            'loss_cls': l_cls.item(),
             'loss_sp':  l_sp.item(),
             'loss_bal': l_bal.item(),
             'loss_div': l_div.item(),
@@ -1768,6 +1861,186 @@ class GMOE_Full(GMoEVariantBase):
 class GMOE_Full_Unlearn(GMOE_Full):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(GMOE_Full_Unlearn, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self._modular_optimizer = None
+        self._teacher = None
+        self._modular_expert_indices = None
+        # Optional extra regularizer during unlearn (off by default — paper uses
+        # L_forget + β L_retain + γ L_distill only). L_sp/L_bal need a trainable
+        # router; L_div is the only term that can affect selected experts.
+        self.modular_unlearn_use_modular_reg = hparams.get(
+            'modular_unlearn_use_modular_reg', False)
+        self.modular_unlearn_lambda_div = hparams.get(
+            'modular_unlearn_lambda_div', 0.0)
+
+    def _modular_unlearn_reg_loss(self, h_stack):
+        """
+        Optional diversity on selected experts only (Frobenius-normalized, pair-normalized).
+        Returns (reg, l_sp, l_bal, l_div) with l_sp/l_bal zero (not used at unlearn).
+        """
+        zero = h_stack.new_zeros(())
+        if not self.modular_unlearn_use_modular_reg:
+            return zero, zero, zero, zero
+        lam_div = float(self.modular_unlearn_lambda_div)
+        if lam_div <= 0.0:
+            return zero, zero, zero, zero
+        idx = self._modular_expert_indices or []
+        if len(idx) < 2:
+            return zero, zero, zero, zero
+        h_sel = h_stack[:, idx, :]
+        l_div = loss_diversity(
+            h_sel, fro_normalize=True, normalize_by_pairs=True)
+        reg = lam_div * l_div
+        return reg, zero, zero, l_div
+
+    @torch.no_grad()
+    def compute_expert_relevance_scores(self, data_loader, device, max_batches=200):
+        """Mean routing weight per expert over samples (paper Eq. expert score)."""
+        self.eval()
+        scores = torch.zeros(self.moe_head.num_experts, device=device)
+        total = 0
+        it = iter(data_loader)
+        for _ in range(max_batches):
+            try:
+                x, _y = next(it)
+            except StopIteration:
+                break
+            x = x.to(device)
+            _logits, pi, _h = self._forward(x)
+            scores += pi.sum(dim=0)
+            total += x.size(0)
+        self.train()
+        return scores / max(total, 1)
+
+    def _select_experts_for_unlearn(self, scores, top_k=None, tau=None):
+        """Return sorted list of expert indices in M_f (top-k and/or threshold)."""
+        M = self.moe_head.num_experts
+        if tau is not None:
+            idx = [m for m in range(M) if scores[m].item() > float(tau)]
+            if len(idx) == 0:
+                idx = [int(torch.argmax(scores).item())]
+            return sorted(idx)
+        k = int(top_k) if top_k is not None else max(1, M // 4)
+        k = min(max(k, 1), M)
+        _vals, inds = torch.topk(scores, k=k)
+        return sorted(inds.detach().cpu().tolist())
+
+    def begin_modular_unlearn(self, forget_loader, device):
+        """
+        Expert relevance on forget data, freeze router + backbone + non-selected
+        experts + classifier; build optimizer over selected expert parameters only.
+        Instantiates a frozen teacher copy for distillation on retain data.
+        """
+        hp = self.hparams
+        max_batches = int(hp.get('modular_score_max_batches', 200))
+        scores = self.compute_expert_relevance_scores(
+            forget_loader, device, max_batches=max_batches)
+
+        top_k = hp.get('modular_unlearn_topk', None)
+        tau = hp.get('modular_unlearn_tau', None)
+        if tau is not None:
+            expert_indices = self._select_experts_for_unlearn(scores, top_k=None, tau=tau)
+        else:
+            expert_indices = self._select_experts_for_unlearn(
+                scores, top_k=top_k, tau=None)
+
+        self._modular_expert_indices = expert_indices
+
+        self._teacher = copy.deepcopy(self)
+        self._teacher.eval()
+        self._teacher.to(device)
+        for p in self._teacher.parameters():
+            p.requires_grad_(False)
+
+        for p in self.parameters():
+            p.requires_grad_(False)
+        for m in expert_indices:
+            for p in self.moe_head.experts[m].parameters():
+                p.requires_grad_(True)
+
+        trainable = [p for p in self.parameters() if p.requires_grad]
+        ulr = hp.get('modular_unlearn_lr', hp['lr'])
+        wd = hp.get('modular_unlearn_weight_decay', hp['weight_decay'])
+        self._modular_optimizer = torch.optim.Adam(trainable, lr=ulr, weight_decay=wd)
+
+        print(f'[*] Unlearn modular reg: use={self.modular_unlearn_use_modular_reg}, '
+              f'lambda_div={self.modular_unlearn_lambda_div}')
+        print('[*] loss_sp / loss_bal in logs = routing diagnostics only (not in unlearn loss; router frozen).')
+        return {
+            'expert_indices': expert_indices,
+            'scores': scores.detach().cpu().tolist(),
+        }
+
+    def update_modular_unlearn(self, minibatch_forget, minibatch_retain, unlabeled=None):
+        """
+        Unlearning objective (paper):
+          L_unlearn = L_forget + β L_retain + γ L_distill
+                    [+ optional λ_div L_div on selected experts only]
+        L_sp / L_bal are training-only (router frozen here). Optional L_div uses
+        Frobenius-normalized decorrelation on experts being unlearned.
+        Only selected expert parameters receive gradients; router and backbone frozen.
+        """
+        if self._modular_optimizer is None:
+            raise RuntimeError('Call begin_modular_unlearn() before update_modular_unlearn().')
+
+        device = next(self.parameters()).device
+        xf, yf = minibatch_forget[0]
+        xr, yr = minibatch_retain[0]
+        xf, yf = xf.to(device), yf.to(device)
+        xr, yr = xr.to(device), yr.to(device)
+
+        beta = float(self.hparams.get('modular_unlearn_beta', 1.0))
+        gamma = float(self.hparams.get('modular_unlearn_gamma', 1.0))
+
+        logits_f, pi_f, h_f = self._forward(xf)
+        l_forget = -F.cross_entropy(logits_f, yf)
+
+        logits_r, pi_r, h_r = self._forward(xr)
+        l_retain = F.cross_entropy(logits_r, yr)
+
+        # L_distill = E_{x in D_r}[ KL( p_old(y|x) || p_new(y|x) ) ]
+        with torch.no_grad():
+            t_logits = self._teacher.predict(xr)
+        log_p_old = F.log_softmax(t_logits, dim=-1)
+        log_p_new = F.log_softmax(logits_r, dim=-1)
+        p_old = log_p_old.exp()
+        l_distill = (p_old * (log_p_old - log_p_new)).sum(dim=-1).mean()
+        distill_term = gamma * l_distill
+
+        reg_f, _l_sp_f, _l_bal_f, l_div_f = self._modular_unlearn_reg_loss(h_f)
+        reg_r, _l_sp_r, _l_bal_r, l_div_r = self._modular_unlearn_reg_loss(h_r)
+        modular_reg = 0.5 * (reg_f + reg_r)
+        l_div = 0.5 * (l_div_f + l_div_r)
+        # Monitor routing sparsity / balance (no grad into frozen router).
+        with torch.no_grad():
+            l_sp = 0.5 * (loss_sparse(pi_f) + loss_sparse(pi_r))
+            l_bal = 0.5 * (loss_balance(pi_f) + loss_balance(pi_r))
+
+        loss = l_forget + beta * l_retain + distill_term + modular_reg
+
+        self._modular_optimizer.zero_grad()
+        loss.backward()
+        self._modular_optimizer.step()
+
+        return {
+            'loss': loss.item(),
+            'loss_forget': l_forget.item(),
+            'loss_retain': l_retain.item(),
+            'loss_distill': l_distill.item(),
+            'loss_distill_weighted': distill_term.item(),
+            'loss_sp': l_sp.item(),
+            'loss_bal': l_bal.item(),
+            'loss_div': l_div.item(),
+            'loss_div_weighted': modular_reg.item(),
+            'loss_modular_reg': modular_reg.item(),
+        }
+
+    def end_modular_unlearn(self):
+        """Restore trainable flags after modular unlearning (e.g. before checkpoint I/O)."""
+        self._modular_optimizer = None
+        self._teacher = None
+        self._modular_expert_indices = None
+        for p in self.parameters():
+            p.requires_grad_(True)
 
     def update_finetune(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])

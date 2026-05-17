@@ -151,7 +151,7 @@ if __name__ == "__main__":
         raise NotImplementedError
 
     if not (args.debug == "True"):
-        wandb.login(key="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")
+        # wandb.login(key="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")
 
         _NEVER_SHOW = {
             'data_augmentation', 'resnet18', 'resnet_dropout',
@@ -166,19 +166,19 @@ if __name__ == "__main__":
         if len(run_name) > 128:
             run_name = run_name[:125] + '...'
 
-        wandb.init(
-            project=WANDB_PROJECT,
-            name=run_name,
-            config={
-                'dataset': args.dataset,
-                'algorithm': args.algorithm,
-                'seed': args.seed,
-                'trial_seed': args.trial_seed,
-                'hparams_seed': args.hparams_seed,
-                **{f'hp/{k}': hparams[k] for k in sorted(relevant_keys)},
-            },
-            settings=wandb.Settings(start_method='thread'),
-        )
+        # wandb.init(
+        #     project=WANDB_PROJECT,
+        #     name=run_name,
+        #     config={
+        #         'dataset': args.dataset,
+        #         'algorithm': args.algorithm,
+        #         'seed': args.seed,
+        #         'trial_seed': args.trial_seed,
+        #         'hparams_seed': args.hparams_seed,
+        #         **{f'hp/{k}': hparams[k] for k in sorted(relevant_keys)},
+        #     },
+        #     settings=wandb.Settings(start_method='thread'),
+        # )
 
     # deterministic split
     full_dataset = ConcatDataset([env for env in dataset])
@@ -346,8 +346,8 @@ if __name__ == "__main__":
                 last_results_keys = results_keys
             misc.print_row([results[key] for key in results_keys], colwidth=12)
 
-            if wandb.run:
-                wandb.log(results)
+            # if wandb.run:
+            #     wandb.log(results)
 
             epochs_path = os.path.join(args.output_dir, 'results.jsonl')
             with open(epochs_path, 'a') as f:
