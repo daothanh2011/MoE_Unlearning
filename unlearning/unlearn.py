@@ -2,6 +2,7 @@
 
 import argparse
 import collections
+import copy
 import json
 import os
 import random
@@ -25,6 +26,7 @@ from torch.utils.data import ConcatDataset, random_split, dataset
 from torchvision import transforms
 
 import metrics
+import splits
 
 # Patch Tutel CUDA kernels with pure-PyTorch fallbacks BEFORE importing
 # vision_transformer / algorithms (which import tutel at module level).
@@ -40,26 +42,77 @@ from domainbed.lib.sweep_logger import SweepLogger
 
 from torchvision.transforms.functional import to_pil_image
 
-class ApplyTransform(Dataset):
-    def __init__(self, subset, transform=None):
-        self.subset = subset
-        self.transform = transform
-        
-    def __getitem__(self, index):
-        x, y = self.subset[index]
-        if self.transform:
-            if isinstance(x, torch.Tensor):
-                x = to_pil_image(x)
-            x = self.transform(x)
-        return x, y
-        
-    def __len__(self):
-        return len(self.subset)
-
 
 def _mia_in_stop_band(mia_score, low, high):
     """True if loss-based MIA attack accuracy is in [low, high] (chance = 0.5)."""
     return low <= mia_score <= high
+
+
+# Checkpoints from train.py use these names; unlearn needs *Unlearn algorithm classes.
+_UNLEARN_ALGORITHM_ALIASES = {
+    'ERM': 'ERM_Unlearn',
+    'GMOE_Full': 'GMOE_Full_Unlearn',
+    'GMOE_ModularLearn': 'GMOE_Full_Unlearn',
+}
+
+
+def resolve_unlearn_algorithm_name(algorithm_name, unlearn_algo):
+    """Map training algorithm to one that implements update_finetune / update_ga / …"""
+    if unlearn_algo == 'modular':
+        if algorithm_name not in ('GMOE_Full_Unlearn',):
+            raise ValueError(
+                f"modular unlearning requires --algorithm GMOE_Full_Unlearn "
+                f"(got {algorithm_name!r}).")
+        return algorithm_name
+    alias = _UNLEARN_ALGORITHM_ALIASES.get(algorithm_name)
+    return alias if alias is not None else algorithm_name
+
+
+def _infer_gold_checkpoint_path(checkpoint_path):
+    """Guess retrained gold checkpoint from origin train output path."""
+    if checkpoint_path is None:
+        return None
+    for origin_tag in ("_origin_", "/origin_"):
+        if origin_tag in checkpoint_path:
+            candidate = checkpoint_path.replace(origin_tag, "_retrained_", 1)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def _load_algorithm_network(algorithm_class, dataset, hparams, checkpoint_path, device):
+    algo = algorithm_class(dataset.input_shape, dataset.num_classes, 1, hparams)
+    state = torch.load(checkpoint_path, map_location="cpu")
+    algo.network.load_state_dict(state)
+    algo.to(device)
+    algo.eval()
+    return algo
+
+
+def _apply_lotus_metrics(results, unlearned, original, gold, loaders, device, num_classes):
+    """Merge LoTUS-style JSD / RF-JSD / Avg Gap into results dict."""
+    forget_loader, retain_loader, test_loader, unseen_loader = loaders
+    lotus = metrics.lotus_evaluation(
+        unlearned,
+        original,
+        gold,
+        forget_loader,
+        retain_loader,
+        test_loader,
+        unseen_loader,
+        device,
+        num_classes=num_classes,
+    )
+    # Keep existing keys; add LoTUS metrics (overwrite acc/mia with same values).
+    for key in (
+        "forget_acc", "retain_acc", "test_acc", "mia_score",
+        "js_forget", "rf_jsd",
+        "mia_gap", "forget_acc_gap", "retain_acc_gap", "test_acc_gap", "avg_gap",
+        "gold_forget_acc", "gold_retain_acc", "gold_test_acc", "gold_mia_score",
+    ):
+        if key in lotus and not (isinstance(lotus[key], float) and np.isnan(lotus[key])):
+            results[key] = lotus[key]
+    return results
 
 
 if __name__ == "__main__":
@@ -67,6 +120,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Unlearning')
     parser.add_argument('--checkpoint_path', type=str, default=None)
+    parser.add_argument(
+        '--gold_checkpoint_path', type=str, default=None,
+        help='Retrained gold-standard checkpoint (train.py --train_setting retrained). '
+             'If omitted, tries to infer from --checkpoint_path by replacing origin→retrained.')
     parser.add_argument('--debug', default="True")
     
     parser.add_argument('--unlearn_algo', type=str, default='finetune',
@@ -128,8 +185,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    ul_param = args.unlearn_random_ratio if args.unlearn_setting == 'random' else args.unlearn_num_class
-    if ul_param is None: ul_param = "default"
+    ul_param = splits.output_ul_param(args)
     args.output_dir = f"unlearning/train_output/unlearn_{args.unlearn_algo}_{args.algorithm}_{args.dataset}_{args.unlearn_setting}_{ul_param}_seed_{args.seed}"
 
     start_step = 0
@@ -150,11 +206,18 @@ if __name__ == "__main__":
     for k, v in sorted(vars(args).items()):
         print('\t{}: {}'.format(k, v))
 
+    unlearn_algorithm = resolve_unlearn_algorithm_name(
+        args.algorithm, args.unlearn_algo)
+    if unlearn_algorithm != args.algorithm:
+        print(f"[*] Unlearn algorithm: {args.algorithm} -> {unlearn_algorithm} "
+              f"(checkpoint-compatible; adds {args.unlearn_algo} update methods)")
+
     if args.hparams_seed == 0:
-        hparams = hparams_registry.default_hparams(args.algorithm, args.dataset)
+        hparams = hparams_registry.default_hparams(unlearn_algorithm, args.dataset)
     else:
-        hparams = hparams_registry.random_hparams(args.algorithm, args.dataset,
-                                                  misc.seed_hash(args.hparams_seed, args.trial_seed))
+        hparams = hparams_registry.random_hparams(
+            unlearn_algorithm, args.dataset,
+            misc.seed_hash(args.hparams_seed, args.trial_seed))
     if args.hparams:
         hparams.update(json.loads(args.hparams))
 
@@ -233,89 +296,19 @@ if __name__ == "__main__":
         #     settings=wandb.Settings(start_method='thread'),
         # )
 
-    # deterministic split
-    full_dataset = ConcatDataset([env for env in dataset])
-    total_size = len(full_dataset)
+    split_bundle = splits.build_unlearning_splits(dataset, args)
+    train_transform, eval_transform = splits.get_transforms(
+        args.dataset, split_bundle.protocol)
 
-    # 80% train, 10% test, 10% unseen
-    train_size = int(total_size * 0.8)
-    test_size = int(total_size * 0.1)
-    unseen_size = total_size - train_size - test_size
+    retain_subset = split_bundle.retain_subset
+    forget_subset = split_bundle.forget_subset
 
-    all_indices = list(range(total_size))
-
-    train_indices = all_indices[:train_size]
-    test_indices = all_indices[train_size : train_size + test_size]
-    unseen_indices = all_indices[train_size + test_size :]
-
-    train_subset = Subset(full_dataset, train_indices)
-    test_subset = Subset(full_dataset, test_indices)
-    unseen_subset = Subset(full_dataset, unseen_indices)
-
-    if args.unlearn_setting == 'random':
-        forget_ratio = float(args.unlearn_random_ratio) if args.unlearn_random_ratio else 0.1
-        forget_size = int(train_size * forget_ratio)
-        retain_size = train_size - forget_size
-
-        forget_indices = train_indices[:forget_size]
-        retain_indices = train_indices[forget_size:]
-
-        retain_subset = Subset(full_dataset, retain_indices)
-        forget_subset = Subset(full_dataset, forget_indices)
-        
-        print(f"[*] Unlearn Setting: SEQUENTIAL 'RANDOM' | Retain: {retain_size} | Forget: {forget_size}")
-
-    elif args.unlearn_setting == 'class':
-        num_class_forget = int(args.unlearn_num_class) if args.unlearn_num_class else 1
-        
-        all_classes = list(range(dataset.num_classes))
-        forget_classes = all_classes[:num_class_forget]
-
-        print(f"[*] Unlearn Setting: SEQUENTIAL CLASS | Classes to forget: {forget_classes}")
-
-        retain_indices = []
-        forget_indices = []
-
-        for idx in train_indices:
-            _, y = full_dataset[idx] 
-            y_val = y.item() if isinstance(y, torch.Tensor) else y
-            
-            if y_val in forget_classes:
-                forget_indices.append(idx)
-            else:
-                retain_indices.append(idx)
-
-        retain_subset = Subset(full_dataset, retain_indices)
-        forget_subset = Subset(full_dataset, forget_indices)
-        
-        print(f"[*] Retain size: {len(retain_subset)} | Forget size: {len(forget_subset)}")
-
-    else:
-        raise ValueError("unlearn_setting must be 'random' or 'class'")
-
-    train_transform = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomAffine(0, shear=10, scale=(0.8, 1.2)),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        transforms.ToTensor()
-    ])
-
-    test_transform = transforms.Compose([
-        transforms.ToTensor()
-    ])
-
-    unseen_transform = transforms.Compose([
-        transforms.ToTensor()
-    ])
-
-    train_set = ApplyTransform(train_subset, transform=train_transform)
-    test_set = ApplyTransform(test_subset, transform=test_transform)
-
-    forget_set_train = ApplyTransform(forget_subset, transform=train_transform)
-    forget_set_test = ApplyTransform(forget_subset, transform=test_transform)
-    retain_set_train = ApplyTransform(retain_subset, transform=train_transform)
-    retain_set_test = ApplyTransform(retain_subset, transform=test_transform)
-    unseen_set = ApplyTransform(unseen_subset, transform=unseen_transform)
+    retain_set_train = splits.ApplyTransform(retain_subset, transform=train_transform)
+    forget_set_train = splits.ApplyTransform(forget_subset, transform=train_transform)
+    retain_set_test = splits.ApplyTransform(retain_subset, transform=eval_transform)
+    forget_set_test = splits.ApplyTransform(forget_subset, transform=eval_transform)
+    test_set = splits.ApplyTransform(split_bundle.test_subset, transform=eval_transform)
+    unseen_set = splits.ApplyTransform(split_bundle.unseen_subset, transform=eval_transform)
 
     retain_train_loader = InfiniteDataLoader(dataset=retain_set_train, weights=None, batch_size=hparams['batch_size'], num_workers=dataset.N_WORKERS)
     forget_train_loader = InfiniteDataLoader(dataset=forget_set_train, weights=None, batch_size=hparams['batch_size'], num_workers=dataset.N_WORKERS)
@@ -325,7 +318,7 @@ if __name__ == "__main__":
     unseen_loader = FastDataLoader(dataset=unseen_set, batch_size=64, num_workers=dataset.N_WORKERS)
     test_loader = FastDataLoader(dataset=test_set, batch_size=64, num_workers=dataset.N_WORKERS)
 
-    algorithm_class = algorithms.get_algorithm_class(args.algorithm)
+    algorithm_class = algorithms.get_algorithm_class(unlearn_algorithm)
     algorithm = algorithm_class(dataset.input_shape, dataset.num_classes,
                                 1, hparams) 
 
@@ -336,6 +329,34 @@ if __name__ == "__main__":
         print("[WARNING] No --checkpoint_path provided for unlearning! Training from scratch?")
 
     algorithm.to(device)
+
+    gold_checkpoint = args.gold_checkpoint_path or _infer_gold_checkpoint_path(args.checkpoint_path)
+    original_algorithm = _load_algorithm_network(
+        algorithm_class, dataset, hparams, args.checkpoint_path, device
+    ) if args.checkpoint_path else None
+    gold_algorithm = None
+    if gold_checkpoint is not None:
+        print(f"[*] Gold-standard (retrained) checkpoint: {gold_checkpoint}")
+        gold_algorithm = _load_algorithm_network(
+            algorithm_class, dataset, hparams, gold_checkpoint, device
+        )
+    else:
+        print("[WARNING] No gold checkpoint — JSD vs gold and Avg Gap will be skipped. "
+              "Train with: train.py --train_setting retrained ... then pass --gold_checkpoint_path")
+
+    eval_loaders = (forget_test_loader, retain_test_loader, test_loader, unseen_loader)
+
+    def _evaluate(results):
+        if original_algorithm is None:
+            results['test_acc'] = metrics.test_acc(algorithm, test_loader, device)
+            results['retain_acc'] = metrics.retain_acc(algorithm, retain_test_loader, device)
+            results['forget_acc'] = metrics.forget_acc(algorithm, forget_test_loader, device)
+            results['mia_score'] = metrics.mia(algorithm, forget_test_loader, unseen_loader, device)
+            return results
+        return _apply_lotus_metrics(
+            results, algorithm, original_algorithm, gold_algorithm,
+            eval_loaders, device, dataset.num_classes,
+        )
 
     n_steps = args.steps or dataset.N_STEPS
     checkpoint_vals = collections.defaultdict(lambda: [])
@@ -359,10 +380,7 @@ if __name__ == "__main__":
         for key, val in step_vals.items():
             results[key] = val
 
-        results['test_acc'] = metrics.test_acc(algorithm, test_loader, device)
-        results['retain_acc'] = metrics.retain_acc(algorithm, retain_test_loader, device)
-        results['forget_acc'] = metrics.forget_acc(algorithm, forget_test_loader, device)
-        results['mia_score'] = metrics.mia(algorithm, forget_test_loader, unseen_loader, device)
+        results = _evaluate(results)
 
         results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024. * 1024. * 1024.)
         results['step_time'] = time.time() - step_start_time
@@ -419,10 +437,7 @@ if __name__ == "__main__":
                     for key, val in checkpoint_vals.items():
                         results[key] = np.mean(val)
 
-                    results['test_acc'] = metrics.test_acc(algorithm, test_loader, device)
-                    results['retain_acc'] = metrics.retain_acc(algorithm, retain_test_loader, device)
-                    results['forget_acc'] = metrics.forget_acc(algorithm, forget_test_loader, device)
-                    results['mia_score'] = metrics.mia(algorithm, forget_test_loader, unseen_loader, device)
+                    results = _evaluate(results)
 
                     results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024. * 1024. * 1024.)
                     results['step_time'] = time.time() - step_start_time
@@ -499,10 +514,7 @@ if __name__ == "__main__":
                 for key, val in checkpoint_vals.items():
                     results[key] = np.mean(val)
 
-                results['test_acc'] = metrics.test_acc(algorithm, test_loader, device)
-                results['retain_acc'] = metrics.retain_acc(algorithm, retain_test_loader, device)
-                results['forget_acc'] = metrics.forget_acc(algorithm, forget_test_loader, device)
-                results['mia_score'] = metrics.mia(algorithm, forget_test_loader, unseen_loader, device)
+                results = _evaluate(results)
 
                 results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024. * 1024. * 1024.)
                 results['step_time'] = time.time() - step_start_time

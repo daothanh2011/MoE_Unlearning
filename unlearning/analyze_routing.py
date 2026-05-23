@@ -41,6 +41,8 @@ import domainbed.tutel_patch  # noqa: F401
 from domainbed import algorithms, datasets, hparams_registry
 from domainbed.lib import misc
 
+import splits
+
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description='Analyse GMoE routing.')
@@ -231,39 +233,14 @@ def _save_csv(mat: np.ndarray, row_labels, col_labels, path):
 def _build_subset_indices(
     dataset, args: argparse.Namespace,
 ) -> dict:
-    """Reproduce the deterministic train/test/unseen + retain/forget split used
-    in unlearning/train.py and unlearning/unlearn.py."""
-    indices_with_env = _iter_env_indices(dataset)
-    full_dataset = ConcatDataset([env for env in dataset])
-    total_size = len(full_dataset)
-    assert total_size == len(indices_with_env)
-
-    train_size = int(total_size * 0.8)
-    test_size = int(total_size * 0.1)
-
-    train_idx = indices_with_env[:train_size]
-    test_idx = indices_with_env[train_size: train_size + test_size]
-    unseen_idx = indices_with_env[train_size + test_size:]
-
-    if args.unlearn_setting == 'random':
-        ratio = float(args.unlearn_random_ratio)
-        forget_size = int(train_size * ratio)
-        forget_idx = train_idx[:forget_size]
-        retain_idx = train_idx[forget_size:]
-    else:
-        forget_classes = set(range(int(args.unlearn_num_class)))
-        retain_idx, forget_idx = [], []
-        for g, e, _l in train_idx:
-            _x, y = full_dataset[g]
-            y = int(y.item()) if isinstance(y, torch.Tensor) else int(y)
-            (forget_idx if y in forget_classes else retain_idx).append((g, e, _l))
-
+    """Reproduce splits from unlearning/train.py and unlearning/unlearn.py."""
+    bundle = splits.build_unlearning_splits(dataset, args)
     return {
-        'full_dataset': full_dataset,
-        'full': train_idx + test_idx + unseen_idx,
-        'retain': retain_idx,
-        'forget': forget_idx,
-        'unseen': unseen_idx,
+        'full_dataset': bundle.full_dataset,
+        'full': bundle.routing_indices.get('full', []),
+        'retain': bundle.routing_indices.get('retain', []),
+        'forget': bundle.routing_indices.get('forget', []),
+        'unseen': bundle.routing_indices.get('unseen', []),
     }
 
 

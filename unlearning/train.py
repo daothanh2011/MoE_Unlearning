@@ -25,6 +25,7 @@ from torch.utils.data import ConcatDataset, random_split, dataset
 from torchvision import transforms
 
 import metrics
+import splits
 
 # Patch Tutel CUDA kernels with pure-PyTorch fallbacks BEFORE importing
 # vision_transformer / algorithms (which import tutel at module level).
@@ -39,22 +40,6 @@ from domainbed.lib.fast_data_loader import InfiniteDataLoader, FastDataLoader
 from domainbed.lib.sweep_logger import SweepLogger
 
 from torchvision.transforms.functional import to_pil_image
-
-class ApplyTransform(Dataset):
-    def __init__(self, subset, transform=None):
-        self.subset = subset
-        self.transform = transform
-        
-    def __getitem__(self, index):
-        x, y = self.subset[index]
-        if self.transform:
-            if isinstance(x, torch.Tensor):
-                x = to_pil_image(x)
-            x = self.transform(x)
-        return x, y
-        
-    def __len__(self):
-        return len(self.subset)
 
 if __name__ == "__main__":
     WANDB_PROJECT = "sparse_moe_train"
@@ -94,9 +79,13 @@ if __name__ == "__main__":
     parser.add_argument('--num_step_per_evaluate', type=int, default=None,
                         help='Number of steps to run before triggering evaluation. Only applies to retrained mode.')
 
+    parser.add_argument('--retrain_from_scratch', action='store_true',
+                        help='Retrained mode: do not load --checkpoint_path (LoTUS gold trains from scratch).')
+
     args = parser.parse_args()
 
-    args.output_dir = f"unlearning/train_output/{args.algorithm}_{args.train_setting}_{args.dataset}_{args.unlearn_setting}_{args.unlearn_random_ratio}_seed_{args.seed}"
+    ul_param = splits.output_ul_param(args)
+    args.output_dir = f"unlearning/train_output/{args.algorithm}_{args.train_setting}_{args.dataset}_{args.unlearn_setting}_{ul_param}_seed_{args.seed}"
 
     start_step = 0
 
@@ -161,7 +150,7 @@ if __name__ == "__main__":
         relevant_keys = {k for k in hparams if k not in _NEVER_SHOW}
 
         hparam_str = '_'.join(f'{k}={hparams[k]}' for k in sorted(relevant_keys))
-        run_name = f'{args.algorithm}_{args.train_setting}_{args.dataset}_{args.unlearn_setting}_{args.unlearn_random_ratio}_seed_{args.seed}'
+        run_name = f'{args.algorithm}_{args.train_setting}_{args.dataset}_{args.unlearn_setting}_{ul_param}_seed_{args.seed}'
         
         if len(run_name) > 128:
             run_name = run_name[:125] + '...'
@@ -180,91 +169,24 @@ if __name__ == "__main__":
         #     settings=wandb.Settings(start_method='thread'),
         # )
 
-    # deterministic split
-    full_dataset = ConcatDataset([env for env in dataset])
-    total_size = len(full_dataset)
+    split_bundle = splits.build_unlearning_splits(dataset, args)
+    train_transform, eval_transform = splits.get_transforms(
+        args.dataset, split_bundle.protocol)
 
-    # 80% train, 10% test, 10% unseen
-    train_size = int(total_size * 0.8)
-    test_size = int(total_size * 0.1)
-    unseen_size = total_size - train_size - test_size
+    train_subset = split_bundle.train_subset
+    test_subset = split_bundle.test_subset
+    unseen_subset = split_bundle.unseen_subset
+    retain_subset = split_bundle.retain_subset
+    forget_subset = split_bundle.forget_subset
 
-    all_indices = list(range(total_size))
+    train_set = splits.ApplyTransform(train_subset, transform=train_transform)
+    test_set = splits.ApplyTransform(test_subset, transform=eval_transform)
 
-    train_indices = all_indices[:train_size]
-    test_indices = all_indices[train_size : train_size + test_size]
-    unseen_indices = all_indices[train_size + test_size :]
-
-    train_subset = Subset(full_dataset, train_indices)
-    test_subset = Subset(full_dataset, test_indices)
-    unseen_subset = Subset(full_dataset, unseen_indices)
-
-    if args.unlearn_setting == 'random':
-        forget_ratio = float(args.unlearn_random_ratio) if args.unlearn_random_ratio else 0.1
-        forget_size = int(train_size * forget_ratio)
-        retain_size = train_size - forget_size
-
-        forget_indices = train_indices[:forget_size]
-        retain_indices = train_indices[forget_size:]
-
-        retain_subset = Subset(full_dataset, retain_indices)
-        forget_subset = Subset(full_dataset, forget_indices)
-        
-        print(f"[*] Unlearn Setting: SEQUENTIAL 'RANDOM' | Retain: {retain_size} | Forget: {forget_size}")
-
-    elif args.unlearn_setting == 'class':
-        num_class_forget = int(args.unlearn_num_class) if args.unlearn_num_class else 1
-        
-        all_classes = list(range(dataset.num_classes))
-        
-        forget_classes = all_classes[:num_class_forget]
-
-        print(f"[*] Unlearn Setting: SEQUENTIAL CLASS | Classes to forget: {forget_classes}")
-
-        retain_indices = []
-        forget_indices = []
-
-        for idx in train_indices:
-            _, y = full_dataset[idx] 
-            y_val = y.item() if isinstance(y, torch.Tensor) else y
-            
-            if y_val in forget_classes:
-                forget_indices.append(idx)
-            else:
-                retain_indices.append(idx)
-
-        retain_subset = Subset(full_dataset, retain_indices)
-        forget_subset = Subset(full_dataset, forget_indices)
-        
-        print(f"[*] Retain size: {len(retain_subset)} | Forget size: {len(forget_subset)}")
-
-    else:
-        raise ValueError("unlearn_setting must be 'random' or 'class'")
-
-    train_transform = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomAffine(0, shear=10, scale=(0.8, 1.2)),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        transforms.ToTensor()
-    ])
-
-    test_transform = transforms.Compose([
-        transforms.ToTensor()
-    ])
-
-    unseen_transform = transforms.Compose([
-        transforms.ToTensor()
-    ])
-
-    train_set = ApplyTransform(train_subset, transform=train_transform)
-    # TA, the transform should be the same with original
-    test_set = ApplyTransform(test_subset, transform=test_transform)
-
-    forget_set_train = ApplyTransform(forget_subset, transform=train_transform)
-    forget_set_test = ApplyTransform(forget_subset, transform=test_transform)
-    retain_set_train = ApplyTransform(retain_subset, transform=train_transform)
-    retain_set_test = ApplyTransform(retain_subset, transform=test_transform)
-    unseen_set = ApplyTransform(unseen_subset, transform=unseen_transform)
+    forget_set_train = splits.ApplyTransform(forget_subset, transform=train_transform)
+    forget_set_test = splits.ApplyTransform(forget_subset, transform=eval_transform)
+    retain_set_train = splits.ApplyTransform(retain_subset, transform=train_transform)
+    retain_set_test = splits.ApplyTransform(retain_subset, transform=eval_transform)
+    unseen_set = splits.ApplyTransform(unseen_subset, transform=eval_transform)
 
     if args.train_setting == 'retrained':
         active_train_set = retain_set_train
@@ -294,9 +216,12 @@ if __name__ == "__main__":
     algorithm = algorithm_class(dataset.input_shape, dataset.num_classes,
                                 1, hparams) 
 
-    if args.checkpoint_path is not None:
+    if args.checkpoint_path is not None and not (
+            args.train_setting == 'retrained' and args.retrain_from_scratch):
         checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
         algorithm.network.load_state_dict(checkpoint)
+    elif args.train_setting == 'retrained' and args.retrain_from_scratch:
+        print("[*] Retrained mode: training from scratch (LoTUS-style, no warm-start).")
 
     algorithm.to(device)
 

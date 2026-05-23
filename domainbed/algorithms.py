@@ -1415,11 +1415,11 @@ class GMoEVariantBase(nn.Module):
             print(f'[GMoEVariantBase] gate_k={gate_k} requested but soft routing '
                   f'uses all experts — gate_k is ignored.')
 
-        # ---- Backbone ----
-        self.featurizer = DeiTFeaturizer(
-            model_name=model_name,
-            pretrained=True,
-        ).cuda()
+        # ---- Backbone (32×32 CIFAR → Wide-ResNet; 224×224 DG → ViT/DeiT) ----
+        self.featurizer = build_gmoe_featurizer(input_shape, hparams).cuda()
+        if tuple(input_shape[1:3]) == (32, 32) and model_name != 'wide_resnet':
+            print(f'[GMoEVariantBase] input {input_shape[1:3]} → Wide-ResNet '
+                  f'(ignoring hparams model={model_name!r})')
 
         # Optional freeze — disables gradients on backbone params and forces
         # eval mode so BatchNorm / Dropout stats don't drift.  Params with
@@ -1449,11 +1449,29 @@ class GMoEVariantBase(nn.Module):
             router_temperature=hparams.get('router_temperature', 1.0),
         ).cuda()
 
-        self.optimizer = torch.optim.Adam(
-            list(self.featurizer.parameters()) + list(self.moe_head.parameters()),
-            lr=hparams['lr'],
-            weight_decay=hparams['weight_decay'],
-        )
+        train_params = list(self.featurizer.parameters()) + list(self.moe_head.parameters())
+        opt_name = str(hparams.get('optimizer', 'adam')).lower()
+        if opt_name == 'sgd':
+            self.optimizer = torch.optim.SGD(
+                train_params,
+                lr=hparams['lr'],
+                momentum=hparams.get('momentum', 0.9),
+                weight_decay=hparams['weight_decay'],
+                nesterov=hparams.get('nesterov', True),
+            )
+        else:
+            self.optimizer = torch.optim.Adam(
+                train_params,
+                lr=hparams['lr'],
+                weight_decay=hparams['weight_decay'],
+            )
+
+        self.scheduler = None
+        sched = hparams.get('lr_scheduler', None)
+        if sched == 'cosine':
+            t_max = int(hparams.get('cosine_steps', 20000))
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=t_max)
 
         self.balance_loss_fn = LoadBalanceLoss(
             num_experts=num_experts,
@@ -1510,7 +1528,8 @@ class GMoEVariantBase(nn.Module):
               f'expert_dim={self.moe_head.expert_dim}  '
               f'expert_depth={self.moe_head.expert_depth}')
         frozen_tag = '  [FROZEN]' if getattr(self, 'freeze_backbone', False) else ''
-        print(f'  featurizer (ViT){frozen_tag}: {fmt(feat_t)}  trainable={fmt(feat_tr)}')
+        backbone_kind = 'ViT' if hasattr(self.featurizer, 'vit') else 'CNN'
+        print(f'  featurizer ({backbone_kind}){frozen_tag}: {fmt(feat_t)}  trainable={fmt(feat_tr)}')
         print(f'  moe_head total         : {fmt(head_t)}  trainable={fmt(head_tr)}')
         print(f'    ├─ experts ({self.moe_head.num_experts}×)         : {fmt(expert_t)}')
         print(f'    ├─ router              : {fmt(router_t)}')
@@ -1728,7 +1747,11 @@ class GMOE_Full(GMoEVariantBase):
         """
         l_sp = loss_sparse(pi)
         l_bal = self._modular_balance_loss(pi)
-        l_div = loss_diversity(h_stack, fro_normalize=self.div_fro_normalize)
+        l_div = loss_diversity(
+            h_stack,
+            fro_normalize=self.div_fro_normalize,
+            normalize_by_pairs=True,
+        )
         return l_sp, l_bal, l_div
 
     def _compute_invariance(self, h_stack, pi, all_y, dom_id):
@@ -1805,27 +1828,64 @@ class GMOE_ModularLearn(GMOE_Full):
         self.div_fro_normalize = hparams.get('div_fro_normalize', True)
         tau = hparams.get('router_temperature', 2.0)
         self.moe_head.router_temperature = tau
+        self.mixup_alpha = float(hparams.get('mixup_alpha', 0.0))
+        self.label_smoothing = float(hparams.get('label_smoothing', 0.0))
+        self.modular_aux_warmup_steps = int(hparams.get('modular_aux_warmup_steps', 0))
+        self._modular_step = 0
         print(f'[GMOE_ModularLearn] λ_sp={self.lambda_sp} λ_bal={self.lambda_bal} '
               f'λ_div={self.lambda_div} balance={self.balance_loss_type} '
               f'router_temperature={tau} div_fro_normalize={self.div_fro_normalize}')
+        if self.mixup_alpha > 0:
+            print(f'[GMOE_ModularLearn] mixup_alpha={self.mixup_alpha}')
+        if self.label_smoothing > 0:
+            print(f'[GMOE_ModularLearn] label_smoothing={self.label_smoothing}')
+        if self.modular_aux_warmup_steps > 0:
+            print(f'[GMOE_ModularLearn] modular_aux_warmup_steps='
+                  f'{self.modular_aux_warmup_steps}')
+
+    def _classification_loss(self, logits, y, y_mix=None, lam=None):
+        if y_mix is not None and lam is not None:
+            y_a, y_b = y_mix
+            return (lam * F.cross_entropy(logits, y_a, label_smoothing=self.label_smoothing)
+                    + (1.0 - lam) * F.cross_entropy(logits, y_b,
+                                                    label_smoothing=self.label_smoothing))
+        return F.cross_entropy(logits, y, label_smoothing=self.label_smoothing)
+
+    def _aux_scale(self):
+        if self.modular_aux_warmup_steps <= 0:
+            return 1.0
+        return min(1.0, self._modular_step / float(self.modular_aux_warmup_steps))
 
     def update(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
 
+        y_mix = None
+        lam = None
+        if self.mixup_alpha > 0 and all_x.size(0) > 1:
+            lam = float(torch.distributions.Beta(self.mixup_alpha, self.mixup_alpha)
+                        .sample().item())
+            perm = torch.randperm(all_x.size(0), device=all_x.device)
+            all_x = lam * all_x + (1.0 - lam) * all_x[perm]
+            y_mix = (all_y, all_y[perm])
+
         logits, pi, h_stack = self._forward(all_x)
 
-        l_cls = F.cross_entropy(logits, all_y)
+        l_cls = self._classification_loss(logits, all_y, y_mix=y_mix, lam=lam)
         l_sp, l_bal, l_div = self._modular_learn_aux_loss(pi, h_stack)
+        aux_scale = self._aux_scale()
 
         loss = (l_cls
-                + self.lambda_sp * l_sp
-                + self.lambda_bal * l_bal
-                + self.lambda_div * l_div)
+                + aux_scale * self.lambda_sp * l_sp
+                + aux_scale * self.lambda_bal * l_bal
+                + aux_scale * self.lambda_div * l_div)
 
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
+        self._modular_step += 1
 
         return {
             'loss':     loss.item(),
@@ -1833,6 +1893,7 @@ class GMOE_ModularLearn(GMOE_Full):
             'loss_sp':  l_sp.item(),
             'loss_bal': l_bal.item(),
             'loss_div': l_div.item(),
+            'aux_scale': aux_scale,
         }
 
 

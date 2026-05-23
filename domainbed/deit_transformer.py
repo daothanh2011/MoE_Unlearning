@@ -165,6 +165,43 @@ def supported_models():
     return sorted(_MODEL_CONFIG.keys())
 
 
+class WideResNetFeaturizer(nn.Module):
+    """
+    Wide-ResNet backbone for 32×32 inputs (CIFAR-10 / CIFAR-100).
+
+    Depth / width follow standard CIFAR WRN recipes (e.g. 28×10 for CIFAR-10,
+    28×8 for CIFAR-100) via hparams ``wrn_depth`` and ``wrn_widen``.
+    """
+
+    def __init__(self, input_shape, hparams=None, dropout_rate=0.0):
+        super().__init__()
+        from domainbed.lib import wide_resnet
+
+        hp = hparams or {}
+        depth = int(hp.get('wrn_depth', 16))
+        widen = int(hp.get('wrn_widen', 2))
+        dropout = hp.get('resnet_dropout', dropout_rate)
+        self.backbone = wide_resnet.Wide_ResNet(input_shape, depth, widen, dropout)
+        self.n_outputs = self.backbone.n_outputs
+        self.model_name = f'wide_resnet_{depth}_{widen}'
+
+    def forward(self, x):
+        return self.backbone(x)
+
+
+def build_gmoe_featurizer(input_shape, hparams):
+    """
+    Select a GMOE backbone compatible with ``input_shape``.
+
+    - (3, 32, 32)  → Wide-ResNet (CIFAR)
+    - (3, 224, 224) or other → ViT/DeiT via ``hparams['model']``
+    """
+    if tuple(input_shape[1:3]) == (32, 32):
+        return WideResNetFeaturizer(input_shape, hparams=hparams)
+    model_name = hparams.get('model', 'deit_small_patch16_224')
+    return DeiTFeaturizer(model_name=model_name, pretrained=True)
+
+
 # ---------------------------------------------------------------------------
 # Explicit MoE head
 # ---------------------------------------------------------------------------

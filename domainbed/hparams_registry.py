@@ -13,7 +13,7 @@ def _hparams(algorithm, dataset, random_seed):
     Global registry of hyperparams. Each entry is a (default, random) tuple.
     New algorithms / networks / etc. should add entries here.
     """
-    SMALL_IMAGES = ['Debug28', 'RotatedMNIST', 'ColoredMNIST']
+    SMALL_IMAGES = ['Debug28', 'RotatedMNIST', 'ColoredMNIST', 'CIFAR10', 'CIFAR100']
 
     hparams = {}
 
@@ -154,12 +154,21 @@ def _hparams(algorithm, dataset, random_seed):
     else:
         _hparam('lr', 3e-5, lambda r: 10 ** r.uniform(-5, -3.5))
 
-    if dataset in SMALL_IMAGES:
+    if dataset in ('CIFAR10', 'CIFAR100'):
+        _hparam('lr', 1e-3, lambda r: 10 ** r.uniform(-3.5, -2.5))
+        _hparam('weight_decay', 5e-4, lambda r: 5e-4)
+        _hparam('batch_size', 128, lambda r: int(r.choice([64, 128, 256])))
+        _hparam('resnet18', False, lambda r: False)
+        _hparam('resnet_dropout', 0.0, lambda r: 0.0)
+
+    if dataset in SMALL_IMAGES and dataset not in ('CIFAR10', 'CIFAR100'):
         _hparam('weight_decay', 0., lambda r: 0.)
-    else:
+    elif dataset not in ('CIFAR10', 'CIFAR100'):
         _hparam('weight_decay', 0., lambda r: 10 ** r.uniform(-6, -2))
 
-    if dataset in SMALL_IMAGES:
+    if dataset in ('CIFAR10', 'CIFAR100'):
+        pass  # batch_size set in CIFAR block above
+    elif dataset in SMALL_IMAGES:
         _hparam('batch_size', 64, lambda r: int(2 ** r.uniform(3, 9)))
     elif algorithm == 'ARM':
         _hparam('batch_size', 8, lambda r: 8)
@@ -242,6 +251,56 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('use_batch_balance_loss', False, lambda r: False)
         _hparam('router_temperature',     1.0, lambda r: 1.0)
         _hparam('balance_loss_type',      'mse', lambda r: 'mse')
+
+        if dataset == 'CIFAR10':
+            _hparam('model', 'wide_resnet', lambda r: 'wide_resnet')
+            _hparam('wrn_depth', 28, lambda r: 28)
+            _hparam('wrn_widen', 10, lambda r: 10)
+            _hparam('optimizer', 'sgd', lambda r: 'sgd')
+            _hparam('momentum', 0.9, lambda r: 0.9)
+            _hparam('nesterov', True, lambda r: True)
+            _hparam('lr', 0.1, lambda r: 0.1)
+            _hparam('lr_scheduler', 'cosine', lambda r: 'cosine')
+            _hparam('cosine_steps', 20000, lambda r: 20000)
+            _hparam('weight_decay', 5e-4, lambda r: 5e-4)
+            _hparam('batch_size', 128, lambda r: 128)
+            _hparam('resnet_dropout', 0.3, lambda r: 0.3)
+            _hparam('num_experts', 6, lambda r: 6)
+            _hparam('lambda_sp', 0.001, lambda r: 0.001)
+            _hparam('lambda_bal', 0.001, lambda r: 0.001)
+            _hparam('lambda_div', 0.001, lambda r: 0.001)
+            _hparam('router_temperature', 1.0, lambda r: 1.0)
+            _hparam('use_batch_balance_loss', True, lambda r: True)
+            _hparam('div_fro_normalize', True, lambda r: True)
+            _hparam('balance_loss_type', 'mse', lambda r: 'mse')
+            _hparam('mixup_alpha', 0.2, lambda r: 0.2)
+            _hparam('label_smoothing', 0.1, lambda r: 0.1)
+            _hparam('modular_aux_warmup_steps', 1000, lambda r: 1000)
+
+        if dataset == 'CIFAR100':
+            _hparam('model', 'wide_resnet', lambda r: 'wide_resnet')
+            _hparam('wrn_depth', 28, lambda r: 28)
+            _hparam('wrn_widen', 8, lambda r: 8)
+            _hparam('optimizer', 'sgd', lambda r: 'sgd')
+            _hparam('momentum', 0.9, lambda r: 0.9)
+            _hparam('nesterov', True, lambda r: True)
+            _hparam('lr', 0.1, lambda r: 0.1)
+            _hparam('lr_scheduler', 'cosine', lambda r: 'cosine')
+            _hparam('cosine_steps', 20000, lambda r: 20000)
+            _hparam('weight_decay', 5e-4, lambda r: 5e-4)
+            _hparam('batch_size', 128, lambda r: 128)
+            _hparam('resnet_dropout', 0.3, lambda r: 0.3)
+            _hparam('num_experts', 8, lambda r: 8)
+            _hparam('lambda_sp', 0.001, lambda r: 0.001)
+            _hparam('lambda_bal', 0.001, lambda r: 0.001)
+            _hparam('lambda_div', 0.001, lambda r: 0.001)
+            _hparam('router_temperature', 1.0, lambda r: 1.0)
+            _hparam('use_batch_balance_loss', True, lambda r: True)
+            _hparam('div_fro_normalize', True, lambda r: True)
+            _hparam('balance_loss_type', 'mse', lambda r: 'mse')
+            _hparam('mixup_alpha', 0.2, lambda r: 0.2)
+            _hparam('label_smoothing', 0.1, lambda r: 0.1)
+            _hparam('modular_aux_warmup_steps', 2000, lambda r: 2000)
 
     return hparams
 

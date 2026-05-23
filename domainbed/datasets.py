@@ -22,6 +22,8 @@ DATASETS = [
     # Small images
     "ColoredMNIST",
     "RotatedMNIST",
+    "CIFAR10",
+    "CIFAR100",
     # Big images
     "CUB",
     "VLCS",
@@ -757,3 +759,39 @@ class WILDSFMoW(WILDSDataset):
         dataset = FMoWDataset(root_dir=root)
         super().__init__(
             dataset, "region", test_envs, hparams['data_augmentation'], hparams)
+
+
+class _CIFARBase(MultipleDomainDataset):
+    """Single-domain CIFAR for LoTUS-compatible unlearning (train/test splits in splits.py)."""
+
+    INPUT_SHAPE = (3, 32, 32)
+    N_STEPS = 20001
+    CHECKPOINT_FREQ = 500
+    N_WORKERS = 4
+    ENVIRONMENTS = ["default"]
+
+    def __init__(self, root, test_envs, hparams, tv_class, num_classes):
+        super().__init__()
+        if root is None:
+            raise ValueError("Data directory not specified!")
+        self.train_dataset = tv_class(
+            root=root, train=True, download=True, transform=None,
+        )
+        self.test_dataset = tv_class(
+            root=root, train=False, download=True, transform=None,
+        )
+        self.datasets = [self.train_dataset]
+        self.input_shape = self.INPUT_SHAPE
+        self.num_classes = num_classes
+
+
+class CIFAR10(_CIFARBase):
+    def __init__(self, root, test_envs, hparams):
+        from torchvision.datasets import CIFAR10 as CIFAR10TV
+        super().__init__(root, test_envs, hparams, CIFAR10TV, 10)
+
+
+class CIFAR100(_CIFARBase):
+    def __init__(self, root, test_envs, hparams):
+        from torchvision.datasets import CIFAR100 as CIFAR100TV
+        super().__init__(root, test_envs, hparams, CIFAR100TV, 100)

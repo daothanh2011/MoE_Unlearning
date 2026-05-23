@@ -17,6 +17,7 @@ multi_dataset/benchmark_status.json
 
 # General logs
 logs/
+LoTUS/
 
 # Reports
 reports/
